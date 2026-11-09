@@ -1,0 +1,26 @@
+name: ingest
+
+on:
+  schedule:
+    # Hourly 09:00-19:00 IST on weekdays (cron runs in UTC). The 19:00 run
+    # picks up post-market results and the final EOD prices.
+    - cron: "30 3-13 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      days:
+        description: Days of filings to fetch
+        default: "3"
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake the API and start an ingest run
+        env:
+          API: ${{ secrets.FINN_API_URL }}
+          TOKEN: ${{ secrets.PROBE_TOKEN }}
+          DAYS: ${{ github.event.inputs.days || '3' }}
+        run: |
+          # Free Render instances sleep; the first request can take ~50 s.
+          curl -fsS --retry 3 --retry-delay 20 --max-time 90 "$API/health"
+          curl -fsS --max-time 60 -X POST -H "X-Token: $TOKEN" "$API/ingest?days=$DAYS"

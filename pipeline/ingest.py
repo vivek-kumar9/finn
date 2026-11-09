@@ -1,0 +1,151 @@
+"""One ingest pass: prices → signals → filings → categories → stories.
+
+    python -m pipeline.ingest --days 30      # backfill
+    python -m pipeline.ingest                # routine run (last 3 days)
+"""
+import argparse
+import time
+from datetime import date, datetime, timedelta, timezone
+
+import pandas as pd
+
+from pipeline import cards, classify, db, prices, stories
+from pipeline.nse import NSE
+from pipeline.portfolio import HOLDINGS, INDEX, SYMBOLS, WEIGHTS
+
+STORY_LOOKBACK_DAYS = 60  # filings loaded to rebuild stories; > any story window
+
+
+def run(days: int = 3) -> str:
+    run_id = db.client().table("ingest_runs").insert({}).execute().data[0]["id"]
+    try:
+        note = _run(days)
+        ok = True
+    except Exception as e:
+        note, ok = f"{type(e).__name__}: {e}"[:500], False
+    db.client().table("ingest_runs").update({
+        "finished_at": datetime.now(timezone.utc).isoformat(), "ok": ok, "note": note,
+    }).eq("id", run_id).execute()
+    print(("ok: " if ok else "FAILED: ") + note)
+    return note
+
+
+def _run(days: int) -> str:
+    t0 = time.perf_counter()
+    db.upsert("stocks", [
+        {"symbol": s, "name": n, "sector": sec, "size": size, "weight": w, "in_portfolio": True}
+        for s, n, sec, size, w in HOLDINGS
+    ], on_conflict="symbol")
+
+    n_prices = _prices(days)
+    n_new, n_rule, n_model = _filings(days)
+    n_stories = _stories()
+    done, failed, _ = cards.process_pending(limit=15)
+
+    secs = time.perf_counter() - t0
+    return (f"{n_prices} price rows, {n_new} filings ({n_rule} by rules, {n_model} by model), "
+            f"{n_stories} stories, {done} cards built, {failed} failed, in {secs:.0f}s")
+
+
+def _prices(days: int) -> int:
+    frames = prices.download(SYMBOLS)
+    index = frames.get(INDEX)
+    since = pd.Timestamp(date.today() - timedelta(days=days + 5))
+    all_prices, all_signals = [], []
+    for sym, df in frames.items():
+        sig = prices.signals(df, None if sym == INDEX else index)
+        p_rows, s_rows = prices.rows(sym, df, sig, since)
+        all_prices += p_rows
+        if sym != INDEX:
+            all_signals += s_rows
+    db.upsert("prices", all_prices, on_conflict="symbol,date")
+    db.upsert("signals", all_signals, on_conflict="symbol,date")
+    return len(all_prices)
+
+
+def _filings(days: int) -> tuple[int, int, int]:
+    nse = NSE()
+    end, start = date.today(), date.today() - timedelta(days=days)
+    known = {r["id"] for r in db.select("filings", "id", gte_filed_at=start.isoformat())}
+
+    fresh = []
+    for sym in SYMBOLS:
+        try:
+            rows = nse.announcements(sym, start, end)
+        except Exception as e:
+            print(f"{sym}: announcements failed: {e}")
+            continue
+        fresh += [r for r in rows if r["id"] not in known]
+        time.sleep(0.4)  # be polite; 18 calls a run
+
+    leftovers = []
+    for f in fresh:
+        cat = classify.by_rules(f["subject"], f["detail"])
+        f["category"], f["classified_by"] = (cat, "rule") if cat else (None, "model")
+        if not cat:
+            leftovers.append(f)
+    for f, label in zip(leftovers, classify.with_model([(f["subject"], f["detail"]) for f in leftovers])):
+        f["category"] = label
+
+    db.upsert("filings", fresh, on_conflict="id")
+    return len(fresh), len(fresh) - len(leftovers), len(leftovers)
+
+
+def reclassify() -> str:
+    """Re-run rules, then the model, on filings the rules missed earlier."""
+    since = (datetime.now(timezone.utc) - timedelta(days=STORY_LOOKBACK_DAYS)).isoformat()
+    rows = db.select("filings", "id,subject,detail", classified_by="model", gte_filed_at=since)
+    by_rule, leftovers = {}, []
+    for f in rows:
+        cat = classify.by_rules(f["subject"], f["detail"])
+        if cat:
+            by_rule.setdefault(cat, []).append(f["id"])
+        else:
+            leftovers.append(f)
+    by_model: dict[str, list[str]] = {}
+    for f, label in zip(leftovers, classify.with_model([(f["subject"], f["detail"]) for f in leftovers])):
+        by_model.setdefault(label, []).append(f["id"])
+
+    for source, groups in (("rule", by_rule), ("model", by_model)):
+        for cat, ids in groups.items():
+            db.client().table("filings").update({"category": cat, "classified_by": source}) \
+                .in_("id", ids).execute()
+    n = _stories()
+    return (f"{sum(map(len, by_rule.values()))} now by rules, "
+            f"{len(leftovers)} by model {dict((k, len(v)) for k, v in by_model.items())}, {n} stories")
+
+
+def _stories() -> int:
+    since = (datetime.now(timezone.utc) - timedelta(days=STORY_LOOKBACK_DAYS)).isoformat()
+    filings = db.select("filings", "id,symbol,filed_at,subject,detail,attachment_url,category",
+                        gte_filed_at=since)
+    built, assignment = stories.build(filings, WEIGHTS)
+
+    # A story whose lead document changed (e.g. the results PDF arrived after
+    # the board-meeting notice) needs its card rebuilt.
+    existing = {s["id"]: s["lead_url"] for s in db.select("stories", "id,lead_url", gte_last_at=since)}
+    for s in built:
+        if s["id"] not in existing or existing[s["id"]] != s["lead_url"]:
+            s["card_status"] = "pending"
+        s["updated_at"] = datetime.now(timezone.utc).isoformat()
+    # card_status only on some rows: PostgREST needs uniform keys per batch.
+    db.upsert("stories", [s for s in built if "card_status" in s], on_conflict="id")
+    db.upsert("stories", [s for s in built if "card_status" not in s], on_conflict="id")
+
+    by_story: dict[str, list[str]] = {}
+    for fid, sid in assignment.items():
+        by_story.setdefault(sid, []).append(fid)
+    for sid, ids in by_story.items():
+        db.client().table("filings").update({"story_id": sid}).in_("id", ids).execute()
+    return len(built)
+
+
+if __name__ == "__main__":
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--days", type=int, default=3)
+    ap.add_argument("--reclassify", action="store_true", help="re-run rules and model on earlier leftovers")
+    args = ap.parse_args()
+    print(reclassify()) if args.reclassify else run(args.days)
