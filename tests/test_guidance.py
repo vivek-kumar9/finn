@@ -75,3 +75,11 @@ def test_company_and_segment_promises_stay_separate():
     rail = {**company, "scope": "segment", "segment": "Rail", "promise": "b", "low": 20, "high": 25}
     rows = ledger([{"call_period": "Q2 FY27", "url": "u", "items": [company, rail]}], QUARTERS)
     assert len(rows) == 2 and all(r["revisions"] == [] for r in rows)
+
+
+def test_two_statements_on_one_call_are_not_a_revision():
+    a = {"metric": "revenue", "scope": "segment", "segment": "Smart metering", "promise": "FY26 smart metering ₹700-800 cr",
+         "period": "FY26", "low": 700, "high": 800, "unit": "crore", "quote": "q", "page": 12}
+    b = {**a, "promise": "Smart metering order book ₹4,000 cr", "low": 4000, "high": None}
+    rows = ledger([{"call_period": "Q3 FY26", "url": "u", "items": [b, a]}], QUARTERS)
+    assert len(rows) == 2 and all(r["revisions"] == [] for r in rows)

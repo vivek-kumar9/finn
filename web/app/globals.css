@@ -463,3 +463,7 @@ table.num tbody tr + tr > * { border-top: 1px solid var(--line); }
   text-decoration: none;
   font-weight: 500;
 }
+
+.more { margin-top: 12px; }
+.more summary { cursor: pointer; color: var(--text); text-decoration: underline; text-decoration-color: var(--muted); text-underline-offset: 3px; }
+.more[open] summary { margin-bottom: 8px; }

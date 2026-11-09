@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
-import { crore, pct } from "@/lib/format";
+import { crore, pct, times } from "@/lib/format";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "";
 
@@ -138,39 +138,31 @@ function Ledger({ data }: { data?: State["ledger"] }) {
   const good = checkable.filter((r) => r.status === "met" || r.status === "on_track").length;
   const cuts = data.rows.filter((r) => r.revisions.some((v) => v.direction === "cut")).length;
   const dropped = data.calls.reduce((a, c) => a + (c.dropped ?? 0), 0);
+  // Promises reported numbers can test lead; segment and long-range ones fold away.
+  const segment = data.rows.filter((r) => r.status === "unverifiable" && r.basis?.startsWith("Segment"));
+  const shown = data.rows.filter((r) => !segment.includes(r));
+  const lead =
+    checkable.length > 0 ? `${good} of ${checkable.length} checkable promises met or on track.`
+    : segment.length > 0 && segment.length === data.rows.length
+      ? `Management guides business by business rather than for the company as a whole, so none of its ${segment.length} promises can be tested against reported totals.`
+      : data.rows.length === 0 ? "Management made no quantified forward-looking statements in the last four calls."
+      : "No promise in the last four calls can be tested against reported numbers yet.";
   return (
     <section aria-labelledby="ledger">
       <h2 id="ledger">Promised vs delivered</h2>
       {data.note ? <p className="state">{data.note}</p> : (
         <p className="lede">
-          {checkable.length === 0 ? "No promise in the last four calls can be checked against reported numbers yet."
-            : `${good} of ${checkable.length} checkable promises met or on track.`}
-          {cuts > 0 && ` Guidance was cut ${cuts === 1 ? "once" : `${cuts} times`}.`}
+          {lead}
+          {cuts > 0 && ` Guidance was cut ${cuts === 1 ? "once" : `${cuts} times`} between calls.`}
         </p>
       )}
-      <ol className="ledger">
-        {data.rows.map((r, i) => (
-          <li key={i}>
-            <div className="l-top">
-              <span className={`chip ${STATUS[r.status]?.tone}`}>{STATUS[r.status]?.label ?? r.status}</span>
-              <span className="l-period">{r.period}</span>
-            </div>
-            <p className="l-promise">{r.promise}{range(r) && <span className="l-range"> ({range(r)})</span>}</p>
-            {r.actual && <p className="l-actual">Reported: {r.actual}</p>}
-            {!r.actual && r.basis && <p className="l-actual">{r.basis}</p>}
-            {r.revisions.map((v, j) => (
-              <p key={j} className={`l-rev ${v.direction === "cut" ? "down" : v.direction === "raised" ? "up" : ""}`}>
-                {v.direction === "cut" ? "Cut" : v.direction === "raised" ? "Raised" : "Changed"} from{" "}
-                {range({ ...r, low: v.low, high: v.high })} on the {v.call} call
-              </p>
-            ))}
-            <blockquote>
-              &ldquo;{r.quote}&rdquo;{" "}
-              <a href={`${r.url}#page=${r.page}`} target="_blank" rel="noreferrer">{r.call} call, page {r.page}</a>
-            </blockquote>
-          </li>
-        ))}
-      </ol>
+      <ol className="ledger">{shown.map((r, i) => <PromiseRow key={i} r={r} />)}</ol>
+      {segment.length > 0 && (
+        <details className="more" open={shown.length === 0}>
+          <summary>{segment.length} {segment.length === 1 ? "promise" : "promises"} about individual businesses</summary>
+          <ol className="ledger">{segment.map((r, i) => <PromiseRow key={i} r={r} />)}</ol>
+        </details>
+      )}
       {data.calls.length > 0 && (
         <p className="foot">
           Read {data.calls.map((c) => c.call_period).join(", ")} calls.
@@ -179,6 +171,30 @@ function Ledger({ data }: { data?: State["ledger"] }) {
         </p>
       )}
     </section>
+  );
+}
+
+function PromiseRow({ r }: { r: Row }) {
+  return (
+    <li>
+      <div className="l-top">
+        <span className={`chip ${STATUS[r.status]?.tone}`}>{STATUS[r.status]?.label ?? r.status}</span>
+        <span className="l-period">{r.period}</span>
+      </div>
+      <p className="l-promise">{r.promise}{range(r) && <span className="l-range"> ({range(r)})</span>}</p>
+      {r.actual && <p className="l-actual">Reported: {r.actual}</p>}
+      {!r.actual && r.basis && <p className="l-actual">{r.basis}</p>}
+      {r.revisions.map((v, j) => (
+        <p key={j} className={`l-rev ${v.direction === "cut" ? "down" : v.direction === "raised" ? "up" : ""}`}>
+          {v.direction === "cut" ? "Cut" : v.direction === "raised" ? "Raised" : "Changed"} from{" "}
+          {range({ ...r, low: v.low, high: v.high })} on the {v.call} call
+        </p>
+      ))}
+      <blockquote>
+        &ldquo;{r.quote}&rdquo;{" "}
+        <a href={`${r.url}#page=${r.page}`} target="_blank" rel="noreferrer">{r.call} call, page {r.page}</a>
+      </blockquote>
+    </li>
   );
 }
 
@@ -285,17 +301,23 @@ function Balance({ n }: { n: Numbers }) {
 
 function Cash({ n }: { n: Numbers }) {
   const r = n.cash_5y_ratio;
-  const verdict = r == null ? null : r >= 0.9 ? "Profits are turning into cash." : r >= 0.7 ? "Most profit turns into cash, with some leakage." : "Reported profit is running well ahead of cash.";
+  const cfo = n.cash.reduce((a, c) => a + (c.cfo ?? 0), 0);
+  const pat = n.cash.reduce((a, c) => a + (c.pat ?? 0), 0);
+  const lede =
+    r == null ? null
+    : cfo < 0 ? `Over five years, operations used ₹${crore(-cfo)} cr of cash while the company reported ₹${crore(pat)} cr of net profit. Growth is being funded, not earned.`
+    : `Cash from operations was ${r}× net profit over five years. ${
+        r >= 0.9 ? "Profits are turning into cash." : r >= 0.7 ? "Most profit turns into cash, with some leakage." : "Reported profit is running well ahead of cash."}`;
   return (
     <section aria-labelledby="cash">
       <h2 id="cash">Cash quality</h2>
-      {r != null && <p className="lede">Cash from operations was {r}× net profit over five years. {verdict}</p>}
+      {lede && <p className="lede">{lede}</p>}
       <table className="num">
         <thead><tr><th scope="col"><span className="sr">Year</span></th><th scope="col">PAT</th><th scope="col">Cash from ops</th><th scope="col">Ratio</th><th scope="col">Free cash</th></tr></thead>
         <tbody>
           {[...n.cash].reverse().map((c) => (
             <tr key={c.label}><th scope="row">{c.label}</th><td>{crore(c.pat)}</td><td>{crore(c.cfo)}</td>
-              <td className={c.ratio != null && c.ratio < 0.7 ? "down" : ""}>{c.ratio != null ? `${c.ratio}×` : "–"}</td>
+              <td className={c.ratio != null && c.ratio < 0.7 ? "down" : ""}>{times(c.ratio)}</td>
               <td className={c.fcf != null && c.fcf < 0 ? "down" : ""}>{crore(c.fcf)}</td></tr>
           ))}
         </tbody>

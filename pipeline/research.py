@@ -171,7 +171,10 @@ def facts(n: dict) -> list[dict]:
     if ccc and len(ccc) >= 2 and ccc[0][1] is not None and ccc[-1][1] is not None:
         add(f"Cash conversion cycle {ccc[-1][1]:.0f} days in {ccc[-1][0]} vs {ccc[0][1]:.0f} in {ccc[0][0]}")
     if n["cash_5y_ratio"] is not None:
-        add(f"Cash from operations was {n['cash_5y_ratio']}× net profit over 5 years")
+        cfo = sum(x["cfo"] for x in n["cash"] if x["cfo"] is not None)
+        pat = sum(x["pat"] for x in n["cash"] if x["pat"] is not None)
+        add(f"Operations used ₹{-cfo:,.0f} cr of cash over 5 years against ₹{pat:,.0f} cr of net profit" if cfo < 0
+            else f"Cash from operations was {n['cash_5y_ratio']}× net profit over 5 years")
     roce = n["working_capital"].get("ROCE %")
     if roce and roce[-1][1] is not None:
         add(f"ROCE {roce[-1][1]:.0f}% in {roce[-1][0]}")

@@ -219,6 +219,9 @@ def ledger(calls: list[dict], quarters: list[Quarter]) -> list[dict]:
     for call in calls:
         for it in call["items"]:
             k = _key(it)
+            if k in rows and rows[k].call == call["call_period"]:
+                # Two statements on the same call are two promises, not a revision.
+                k = k + (it["promise"].lower()[:60],)
             p = Promise(it["metric"], it.get("scope", "company"), it.get("segment"), it["promise"], it["period"],
                         it.get("low"), it.get("high"), it["unit"], it["quote"], it["page"], call["call_period"], call["url"])
             if k in rows:
