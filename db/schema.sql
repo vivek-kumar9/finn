@@ -77,6 +77,13 @@ create table if not exists watch_rules (
     created_at timestamptz not null default now()
 );
 
+create table if not exists sent_alerts (
+    chat_id bigint not null,
+    key     text not null,            -- s:<story id> or m:<symbol>:<date>
+    sent_at timestamptz not null default now(),
+    primary key (chat_id, key)
+);
+
 create table if not exists research_cache (
     key        text primary key,     -- sha256(source url + prompt version)
     value      jsonb not null,
@@ -109,6 +116,7 @@ alter table stories        enable row level security;
 alter table filings        enable row level security;
 alter table watch_rules    enable row level security;
 alter table research_cache enable row level security;
+alter table sent_alerts    enable row level security;
 alter table usage          enable row level security;
 alter table ingest_runs    enable row level security;
 
@@ -124,4 +132,4 @@ drop policy if exists "public read" on filings;
 create policy "public read" on filings     for select using (true);
 drop policy if exists "public read" on ingest_runs;
 create policy "public read" on ingest_runs for select using (true);
--- watch_rules, research_cache and usage stay server-only.
+-- watch_rules, sent_alerts, research_cache and usage stay server-only.

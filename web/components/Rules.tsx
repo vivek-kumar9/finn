@@ -9,6 +9,15 @@ const MODES: { mode: AlertMode; label: string; help: string }[] = [
   { mode: "fixed", label: "Fixed percentage", help: "Any day the stock moves more than the set percentage." },
 ];
 
+const BOT = process.env.NEXT_PUBLIC_TELEGRAM_BOT;
+
+/** Rules travel to the bot in the /start parameter, which allows only
+ *  letters, digits, _ and -. Numbers go as tenths: 2.5 → 25. */
+function startParam(r: Rules): string {
+  const m = r.mode === "fixed" ? "f" : r.mode === "vs_index" ? "i" : "v";
+  return [m, Math.round(r.zMult * 10), Math.round(r.movePct * 10), Math.round(r.volMult * 10)].join("_");
+}
+
 export function rulesSentence(r: Rules): string {
   const price =
     r.mode === "volatility" ? `moves bigger than ${r.zMult}× the stock’s usual day`
@@ -68,6 +77,20 @@ export function RulesSheet(props: {
         <div className="actions">
           <button className="primary" onClick={save}>Save rules</button>
         </div>
+
+        {BOT && (
+          <div className="telegram">
+            <h4>Get these alerts on your phone</h4>
+            <p>
+              FINN checks filings and prices every hour on market days and messages you on Telegram when something
+              crosses these rules, plus new results, leadership changes, deals, fund raises and pledges.
+            </p>
+            <a className="button" href={`https://t.me/${BOT}?start=${startParam(r)}`} target="_blank" rel="noreferrer"
+               onClick={() => props.onChange(r)}>
+              Connect Telegram
+            </a>
+          </div>
+        )}
       </div>
     </dialog>
   );

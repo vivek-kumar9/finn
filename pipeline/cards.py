@@ -392,7 +392,7 @@ def build(story: dict, company: str) -> dict:
                     x = llm.gemini_json(RESULTS_PROMPT, purpose="results", model=model, fallback=False,
                                         pdf=pdf, schema=RESULTS_SCHEMA)
                     break
-                except llm.QuotaExhausted:
+                except (llm.QuotaExhausted, llm.ModelUnavailable):
                     if i == len(RESULTS_MODELS) - 1:
                         raise
             # The model numbers pages within the excerpt; map back to the filing.
@@ -430,8 +430,8 @@ def process_pending(limit: int = 15) -> tuple[int, int, int]:
                 card = build(s, names.get(s["symbol"], s["symbol"]))
                 update, done = {"card": card, "card_status": "done", "summary": card.get("summary")}, done + 1
                 print(f"{s['id']}: {card['type']} card ok")
-            except llm.QuotaExhausted:
-                print(f"{s['id']}: model quota used up for today, left pending")
+            except (llm.QuotaExhausted, llm.ModelUnavailable) as e:
+                print(f"{s['id']}: {e}; left pending for the next run")
                 continue
             except Exception as e:
                 print(f"{s['id']}: card failed: {type(e).__name__}: {e}")

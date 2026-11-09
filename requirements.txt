@@ -6,3 +6,6 @@ pandas>=2.2
 supabase==2.*
 python-dotenv==1.*
 pypdf==5.*
+rapidfuzz==3.*
+beautifulsoup4==4.*
+lxml>=5

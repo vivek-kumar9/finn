@@ -97,20 +97,24 @@ class QuotaExhausted(RuntimeError):
     pass
 
 
+class ModelUnavailable(RuntimeError):
+    """Overloaded (503) or too slow. Another model will usually answer."""
+
+
 def gemini_json(prompt: str, purpose: str, model: str = GEMINI_FLASH, fallback: bool = True, **kw) -> dict:
     chain = [model] + ([m for m in GEMINI_FALLBACKS if m != model] if fallback else [])
     for i, m in enumerate(chain):
         try:
             return _gemini(prompt, purpose, m, **kw)
-        except QuotaExhausted as e:
+        except (QuotaExhausted, ModelUnavailable) as e:
             if i == len(chain) - 1:
                 raise
-            print(f"{m}: daily quota used up, trying {chain[i + 1]}")
+            print(f"{m}: {e}; trying {chain[i + 1]}")
     raise AssertionError("unreachable")
 
 
 def _gemini(prompt: str, purpose: str, model: str,
-            pdf: bytes | None = None, schema: dict | None = None, retries: int = 3,
+            pdf: bytes | None = None, schema: dict | None = None, retries: int = 2,
             think: str = "low") -> dict:
     """think: "low" for copying facts out of a document, "high" for judgment calls.
     Reading a results table doesn't need a long chain of thought, and Gemini 3.x
@@ -134,19 +138,20 @@ def _gemini(prompt: str, purpose: str, model: str,
                 f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                 headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]},
                 json={"contents": [{"parts": parts}], "generationConfig": config},
-                timeout=120,
+                timeout=90,
             )
         except requests.Timeout:
-            if attempt < retries - 1:
-                continue
-            raise RuntimeError(f"gemini {model}: timed out {retries} times")
+            raise ModelUnavailable(f"gemini {model}: no answer in 90 s")
         if r.status_code == 400 and "thinking" in r.text.lower() and "thinkingConfig" in config:
             config.pop("thinkingConfig")  # model doesn't take the setting; run without it
             continue
         if r.status_code == 429 and "PerDay" in r.text:
             raise QuotaExhausted(f"gemini {model}: daily free quota used up")
-        if r.status_code in (429, 500, 503) and attempt < retries - 1:
-            time.sleep(15 * (attempt + 1))
+        if r.status_code in (500, 503):
+            # Overload is per model; waiting rarely helps, switching does.
+            raise ModelUnavailable(f"gemini {model}: HTTP {r.status_code}, overloaded")
+        if r.status_code == 429 and attempt < retries - 1:
+            time.sleep(10)
             continue
         _raise_for(r, "gemini", model)
         body = r.json()
@@ -157,8 +162,9 @@ def _gemini(prompt: str, purpose: str, model: str,
     raise RuntimeError(f"gemini {model}: out of retries")
 
 
-def cached(key_parts: list[str], fn):
-    """Return a stored model output for these inputs, or compute and store it."""
+def cached(key_parts: list[str], fn, stats: dict | None = None):
+    """Return a stored model output for these inputs, or compute and store it.
+    stats, if given, counts hits and misses for the caller's cost line."""
     import hashlib
 
     from pipeline import db
@@ -166,7 +172,11 @@ def cached(key_parts: list[str], fn):
     key = hashlib.sha256("|".join(key_parts).encode()).hexdigest()
     hit = db.client().table("research_cache").select("value").eq("key", key).execute().data
     if hit:
+        if stats is not None:
+            stats["hits"] = stats.get("hits", 0) + 1
         return hit[0]["value"]
+    if stats is not None:
+        stats["misses"] = stats.get("misses", 0) + 1
     value = fn()
     db.upsert("research_cache", [{"key": key, "value": value}], on_conflict="key")
     return value

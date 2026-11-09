@@ -10,6 +10,8 @@ import { day, istDate, pct, tone, when } from "@/lib/format";
 import type { Filing, Rules, Stock, Story } from "@/lib/types";
 import { CardBody } from "./cards";
 import { RulesSheet, rulesSentence } from "./Rules";
+import Search from "./Search";
+import Link from "next/link";
 
 const store = {
   get<T>(k: string, fallback: T): T {
@@ -134,6 +136,7 @@ export default function Brief() {
   return (
     <main className="shell">
       <Masthead asOf={asOf} onRules={() => setRulesOpen(true)} />
+      <Search />
 
       <nav className="windows" aria-label="Time window">
         {WINDOWS.map((w) => (
@@ -359,7 +362,7 @@ function MoveRow({ move: m, onOpen }: { move: Move; onOpen: (s: Story) => void }
       </p>
       {lead ? (
         <button className="explain" onClick={() => onOpen(lead)}>
-          Likely driver: {lead.headline}
+          Likely driver: {lead.headline.replace(/^[\s,.:;-]+/, "")}
         </button>
       ) : (
         <p className="unexplained">No filing found around this move.</p>
@@ -400,6 +403,7 @@ function StorySheet(props: {
           {s.lead_url && (
             <a className="button" href={s.lead_url} target="_blank" rel="noreferrer">Open filing</a>
           )}
+          <Link className="button quiet-btn" href={`/r/${s.symbol}`}>Research {s.symbol}</Link>
           <button onClick={onPin}>{pinned ? "Unpin" : "Pin"}</button>
           <button onClick={onDone}>{done ? "Restore" : "Clear"}</button>
         </div>

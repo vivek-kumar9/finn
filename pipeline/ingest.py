@@ -41,10 +41,17 @@ def _run(days: int) -> str:
     n_new, n_rule, n_model = _filings(days)
     n_stories = _stories()
     done, failed, _ = cards.process_pending(limit=15)
+    try:
+        from pipeline import telegram
+
+        n_alerts = telegram.send_pending()
+    except Exception as e:  # alerts must never fail the ingest
+        print(f"telegram: {type(e).__name__}: {e}")
+        n_alerts = 0
 
     secs = time.perf_counter() - t0
     return (f"{n_prices} price rows, {n_new} filings ({n_rule} by rules, {n_model} by model), "
-            f"{n_stories} stories, {done} cards built, {failed} failed, in {secs:.0f}s")
+            f"{n_stories} stories, {done} cards built, {failed} failed, {n_alerts} alerts, in {secs:.0f}s")
 
 
 def _prices(days: int) -> int:
