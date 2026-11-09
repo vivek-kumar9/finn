@@ -17,7 +17,7 @@ from pipeline import db, llm
 from pipeline.nse import UA
 from pipeline.stories import WEIGHT
 
-PROMPT_VERSION = "cards-v3"
+PROMPT_VERSION = "cards-v4"
 MIN_WEIGHT = 4  # below this a story stays a one-line routine item
 
 
@@ -127,6 +127,10 @@ RESULTS_SCHEMA = {
     "required": ["basis", "unit", "is_bank", "periods"],
 }
 
+RESULTS_MODELS = [m for m in os.environ.get(
+    "RESULTS_MODELS", "gemini-3.5-flash,gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-flash-latest"
+).split(",") if m]
+
 RESULTS_PROMPT = """This is an Indian listed company's quarterly results filing.
 Read the results table and return the three QUARTER columns: the latest quarter
 (current), the quarter before it (previous_quarter) and the same quarter a year
@@ -217,8 +221,13 @@ def results_card(x: dict, url: str) -> dict:
             }
 
     checks = []
+    top, bottom = ("NII", "PAT") if x["is_bank"] else ("Revenue", "PAT")
     if not x["is_bank"] and (now["Revenue"] or 0) <= 0:
         raise ValueError("revenue missing or non-positive")
+    if now.get(bottom) is None or not prev and not ago:
+        raise ValueError("incomplete table: need PAT and at least one comparison column")
+    if all(r["qoq"] is None and r["yoy"] is None for r in rows if r["metric"] == top):
+        raise ValueError("incomplete table: no comparison for the top line")
     if now.get("PBT") and now.get("PAT") and now["PBT"] > 0 and now["PAT"] > now["PBT"] * 1.3:
         checks.append("PAT well above PBT: check for a tax credit or a misread line")
 
@@ -358,6 +367,8 @@ def generic_card(category: str, pdf: bytes | None, text: str, symbol: str, url: 
             "source": {"url": url}, "routine": False}
     if category == "credit_rating" and str(facts.get("action", "")).lower().startswith("reaffirm"):
         card["routine"] = True  # a reaffirmation is not news
+    if category == "litigation" and isinstance(facts.get("amount_cr"), (int, float)) and facts["amount_cr"] < 1:
+        card["routine"] = True  # a sub-crore penalty doesn't move a listed company
     if category == "dividend" and facts.get("per_share"):
         last = db.client().table("prices").select("close").eq("symbol", symbol) \
             .order("date", desc=True).limit(1).execute().data
@@ -375,7 +386,15 @@ def build(story: dict, company: str) -> dict:
             raise ValueError("results story without a PDF")
         def extract():
             pdf, pages = results_pages(download(url))
-            x = llm.gemini_json(RESULTS_PROMPT, purpose="results", pdf=pdf, schema=RESULTS_SCHEMA)
+            x = None
+            for i, model in enumerate(RESULTS_MODELS):
+                try:
+                    x = llm.gemini_json(RESULTS_PROMPT, purpose="results", model=model, fallback=False,
+                                        pdf=pdf, schema=RESULTS_SCHEMA)
+                    break
+                except llm.QuotaExhausted:
+                    if i == len(RESULTS_MODELS) - 1:
+                        raise
             # The model numbers pages within the excerpt; map back to the filing.
             if x.get("page") and 1 <= x["page"] <= len(pages):
                 x["page"] = pages[x["page"] - 1]
@@ -411,6 +430,9 @@ def process_pending(limit: int = 15) -> tuple[int, int, int]:
                 card = build(s, names.get(s["symbol"], s["symbol"]))
                 update, done = {"card": card, "card_status": "done", "summary": card.get("summary")}, done + 1
                 print(f"{s['id']}: {card['type']} card ok")
+            except llm.QuotaExhausted:
+                print(f"{s['id']}: model quota used up for today, left pending")
+                continue
             except Exception as e:
                 print(f"{s['id']}: card failed: {type(e).__name__}: {e}")
                 update, failed = {"card": {"error": str(e)[:300]}, "card_status": "failed"}, failed + 1
@@ -425,6 +447,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=50)
     ap.add_argument("--retry-failed", action="store_true")
+    ap.add_argument("--redo-results", action="store_true", help="rebuild every results card")
     ap.add_argument("--show", metavar="STORY_ID", help="print the stored extraction for one story")
     args = ap.parse_args()
     if args.show:
@@ -437,6 +460,8 @@ if __name__ == "__main__":
         hit = db.client().table("research_cache").select("value").eq("key", key).execute().data
         print(json.dumps(hit[0]["value"] if hit else "no cached extraction", indent=1))
         raise SystemExit
+    if args.redo_results:
+        db.client().table("stories").update({"card_status": "pending"}).eq("category", "results").execute()
     if args.retry_failed:
         db.client().table("stories").update({"card_status": "pending"}).eq("card_status", "failed").execute()
     print("done %d, failed %d, skipped %d" % process_pending(args.limit))

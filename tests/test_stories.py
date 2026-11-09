@@ -38,3 +38,12 @@ def test_junior_management_change_scores_lower():
 def test_headline_drops_exchange_boilerplate():
     f = {"subject": "Updates", "detail": "Larsen & Toubro Limited has informed the Exchange about receipt of a mega order."}
     assert headline(f) == "Receipt of a mega order"
+
+
+def test_transcript_never_leads_a_results_story():
+    fs = [
+        filing("1", "ETERNAL", "10-21", "results", "Outcome of Board Meeting", "financial results", "o.pdf"),
+        filing("2", "ETERNAL", "10-27", "earnings_call", "Con. Call", "transcript of the earnings call", "t.pdf"),
+    ]
+    stories, _ = build(fs, {})
+    assert stories[0]["lead_url"] == "o.pdf"

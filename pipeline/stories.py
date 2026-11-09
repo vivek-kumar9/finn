@@ -99,7 +99,9 @@ def _lead_rank(category: str, f: dict) -> int:
     if "intimation" in text and category == "results":
         rank -= 2
     if category == "results":
-        if "financial result" in text and "intimation" not in text:
+        if f.get("category") == "earnings_call":
+            rank -= 6  # a call transcript is never the results document
+        elif "financial result" in text and "intimation" not in text:
             rank += 5
         elif "presentation" in text:
             rank += 3
@@ -109,7 +111,7 @@ def _lead_rank(category: str, f: dict) -> int:
 def headline(f: dict) -> str:
     detail = (f.get("detail") or "").strip()
     text = _BOILERPLATE.sub("", detail) if detail else f["subject"]
-    text = text.strip(" .") or f["subject"]
+    text = text.strip(" .,:;-") or f["subject"]
     text = text[0].upper() + text[1:]
     return text if len(text) <= 140 else text[:137].rsplit(" ", 1)[0] + "…"
 

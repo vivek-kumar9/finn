@@ -132,6 +132,14 @@ def _stories() -> int:
     db.upsert("stories", [s for s in built if "card_status" in s], on_conflict="id")
     db.upsert("stories", [s for s in built if "card_status" not in s], on_conflict="id")
 
+    # Stories that no longer exist after regrouping (e.g. a filing moved to
+    # another category) would otherwise linger as duplicates.
+    built_ids = {s["id"] for s in built}
+    stale = [sid for sid in existing if sid not in built_ids]
+    if stale:
+        db.client().table("filings").update({"story_id": None}).in_("story_id", stale).execute()
+        db.client().table("stories").delete().in_("id", stale).execute()
+
     by_story: dict[str, list[str]] = {}
     for fid, sid in assignment.items():
         by_story.setdefault(sid, []).append(fid)

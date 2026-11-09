@@ -52,6 +52,8 @@ def test_bank_uses_net_interest_income():
     x = extraction(is_bank=True, unit="crore", periods=[
         {"role": "current", "period_end": "2026-09-30", "interest_earned": 80000, "interest_expended": 50000,
          "operating_profit": 24000, "pbt": 20000, "pat": 16000},
+        {"role": "previous_quarter", "period_end": "2026-06-30", "interest_earned": 78000, "interest_expended": 49000,
+         "operating_profit": 23000, "pbt": 19000, "pat": 15000},
     ])
     rows = {r["metric"]: r for r in results_card(x, "r.pdf")["rows"]}
     assert rows["NII"]["value"] == 30000.0 and "EBITDA" not in rows
@@ -63,3 +65,10 @@ def test_revenue_falls_back_to_total_income_less_other_income():
         p["total_income"], p["revenue"] = p["revenue"] + p["other_income"], None
     rows = {r["metric"]: r for r in results_card(x, "r.pdf")["rows"]}
     assert rows["Revenue"]["value"] == 1200.0
+
+
+def test_half_read_table_is_rejected():
+    x = extraction()
+    x["periods"] = [x["periods"][0]]  # current column only: no QoQ or YoY possible
+    with pytest.raises(ValueError, match="incomplete"):
+        results_card(x, "r.pdf")
