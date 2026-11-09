@@ -110,3 +110,14 @@ def test_two_models_agreeing_against_screener_is_shown_with_a_flag(monkeypatch):
     card = cards.build({"category": "results", "lead_url": "u", "symbol": "X", "id": "X:results:1"}, "X Ltd")
     assert card["check"] is None
     assert any("screener differs" in c for c in card["checks"])
+
+
+def test_standalone_table_read_as_consolidated_is_relabelled(monkeypatch):
+    from pipeline import cards, screener
+
+    card = results_card(extraction(), "r.pdf")  # claims consolidated; revenue 1,200, PAT 150
+    tables = {"consolidated": {"2026-09-30": {"sales": 1400.0, "pat": 170.0}},
+              "standalone": {"2026-09-30": {"sales": 1200.0, "pat": 150.0}}}
+    monkeypatch.setattr(screener, "quarters", lambda sym, basis: tables[basis])
+    check = cards.cross_check(card, "TITAN", "2026-09-30")
+    assert card["basis"] == "standalone" and check["relabelled"] == "consolidated → standalone"

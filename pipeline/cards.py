@@ -442,25 +442,45 @@ class CheckFailed(ValueError):
     pass
 
 
-def cross_check(card: dict, symbol: str, period_end: str) -> dict:
-    """Compare the extracted quarter with screener's table, compiled independently
-    from the same filings. Revenue and PAT must agree; for banks, PAT only,
-    since screener's bank revenue line is defined differently."""
-    from pipeline import screener
-
-    ref = screener.quarters(symbol, card["basis"]).get(period_end)
+def _compare(card: dict, ref: dict | None) -> str | None:
+    """None when the card agrees with screener's quarter, else what differs."""
     if not ref:
-        raise CheckFailed(f"screener has no {card['basis']} figures for the quarter ending {period_end}")
+        return "screener has no figures for that quarter"
     rows = {r["metric"]: r["value"] for r in card["rows"]}
     pairs = [("PAT", rows.get("PAT"), ref.get("pat"))]
     if not card["bank"]:
         pairs.insert(0, ("Revenue", rows.get("Revenue"), ref.get("sales")))
     for name, ours, theirs in pairs:
         if ours is None or theirs is None:
-            raise CheckFailed(f"{name} missing on one side")
+            return f"{name} missing on one side"
         if abs(ours - theirs) > max(1.0, CHECK_TOLERANCE * abs(theirs)):
-            raise CheckFailed(f"{name} read as {ours:,.0f} but screener has {theirs:,.0f}")
-    return {"against": "screener", "metrics": [p[0] for p in pairs]}
+            return f"{name} read as {ours:,.0f} but screener has {theirs:,.0f}"
+    return None
+
+
+def cross_check(card: dict, symbol: str, period_end: str) -> dict:
+    """Compare the extracted quarter with screener's table, compiled independently
+    from the same filings. Revenue and PAT must agree; for banks, PAT only,
+    since screener's bank revenue line is defined differently.
+
+    Filings carry both standalone and consolidated tables and readers sometimes
+    take one for the other, so a reading that matches the other basis is kept
+    and relabelled rather than thrown away."""
+    from pipeline import screener
+
+    metrics = ["PAT"] if card["bank"] else ["Revenue", "PAT"]
+    claimed = card["basis"]
+    problem = _compare(card, screener.quarters(symbol, claimed).get(period_end))
+    if problem is None:
+        return {"against": "screener", "metrics": metrics}
+    other = "standalone" if claimed == "consolidated" else "consolidated"
+    try:
+        if _compare(card, screener.quarters(symbol, other).get(period_end)) is None:
+            card["basis"] = other
+            return {"against": "screener", "metrics": metrics, "relabelled": f"{claimed} → {other}"}
+    except Exception:
+        pass
+    raise CheckFailed(problem)
 
 
 def build(story: dict, company: str) -> dict:
@@ -504,6 +524,7 @@ def build(story: dict, company: str) -> dict:
                     card = results_card(x, url)
                     current = next(p for p in x["periods"] if p["role"] == "current")
                     x["_check"] = cross_check(card, story["symbol"], current["period_end"])
+                    x["basis"] = card["basis"]
                     x["_model"] = model
                     return x
                 except CheckFailed as e:
@@ -525,6 +546,7 @@ def build(story: dict, company: str) -> dict:
                     card = results_card(x, url)
                     current = next(p for p in x["periods"] if p["role"] == "current")
                     x["_check"] = cross_check(card, story["symbol"], current["period_end"])
+                    x["basis"] = card["basis"]
                     x["_model"] = llm.GROQ_LARGE
                     return x
                 except CheckFailed as e:
@@ -542,6 +564,8 @@ def build(story: dict, company: str) -> dict:
 
         x = llm.cached([url, PROMPT_VERSION, "results"], extract)
         card = results_card(x, url)
+        if (x.get("_check") or {}).get("relabelled"):
+            card["basis"] = x["_check"]["relabelled"].split(" → ")[1]
         card["model"] = x.get("_model")
         card["check"] = x.get("_check")
         if card["check"] and card["check"].get("disputed"):
