@@ -123,6 +123,7 @@ export default function Research({ symbol }: { symbol: string }) {
 }
 
 function range(r: Row) {
+  if (r.unit !== "pct" && r.unit !== "crore") return "";  // "$1 billion" stays in the words
   const u = r.unit === "pct" ? "%" : r.unit === "crore" ? " cr" : "";
   const pre = r.unit === "crore" ? "₹" : "";
   const f = (v: number) => (r.unit === "crore" ? crore(v) : String(v));
@@ -165,7 +166,8 @@ function Ledger({ data }: { data?: State["ledger"] }) {
       )}
       {data.calls.length > 0 && (
         <p className="foot">
-          Read {data.calls.map((c) => c.call_period).join(", ")} calls.
+          Read the last {data.calls.length} earnings calls
+          {data.calls.length > 1 && `, ${data.calls[0].call_period} to ${data.calls[data.calls.length - 1].call_period}`}.
           {dropped > 0 && ` ${dropped} ${dropped === 1 ? "quote was" : "quotes were"} dropped because the words couldn’t be found in the transcript.`}
           {data.calls.some((c) => c.error) && " Some transcripts couldn’t be opened."}
         </p>
@@ -270,7 +272,9 @@ function Trajectory({ n }: { n: Numbers }) {
 
 function Balance({ n }: { n: Numbers }) {
   const wc = n.working_capital;
-  const names = ["Debtor Days", "Inventory Days", "Days Payable", "Cash Conversion Cycle"].filter((k) => wc[k]);
+  // Service companies carry no inventory; rows that are empty every year are dropped.
+  const names = ["Debtor Days", "Inventory Days", "Days Payable", "Cash Conversion Cycle"]
+    .filter((k) => wc[k] && wc[k].some(([, v]) => v != null));
   const cols = names.length ? wc[names[0]].map(([c]) => c) : [];
   return (
     <section aria-labelledby="bs">

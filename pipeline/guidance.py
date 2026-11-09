@@ -109,6 +109,11 @@ class Quarter:
     sales: float | None
     op_profit: float | None
     pat: float | None
+    depreciation: float | None = None
+
+
+_CURRENCY = re.compile(r"constant currency|\bcc\b|dollar|\busd\b|us\$|\$")
+_EBIT = re.compile(r"operating margin|\bebit\b(?!da)")
 
 
 @dataclass
@@ -157,6 +162,12 @@ def judge(p: Promise, quarters: list[Quarter]) -> Verdict:
         return Verdict("unverifiable", None, f"Segment guidance{name}; reported numbers are company-wide")
     if p.metric not in ("revenue_growth", "revenue", "ebitda_margin", "pat_growth"):
         return Verdict("unverifiable", None, "Not in the standard reported financials")
+    said = f"{p.promise} {p.quote}".lower()
+    if p.metric in ("revenue_growth", "revenue") and _CURRENCY.search(said):
+        return Verdict("unverifiable", None,
+                       "Guided in constant currency or dollars; reported revenue is in rupees, so the two don't compare")
+    # "Operating margin" in Indian IT and many others means EBIT, after depreciation.
+    ebit = p.metric == "ebitda_margin" and "ebitda" not in said and bool(_EBIT.search(said))
     span = fiscal.quarters_in(p.period)
     if span is None:
         return Verdict("unverifiable", None, f"Can't place period '{p.period}'")
@@ -181,8 +192,12 @@ def judge(p: Promise, quarters: list[Quarter]) -> Verdict:
         tol = 0.5
     elif p.metric == "ebitda_margin":
         sales, op = _sum(have, "sales"), _sum(have, "op_profit")
+        if ebit:
+            dep = _sum(have, "depreciation")
+            op = None if op is None or dep is None else op - dep
         actual = None if not sales or op is None else op / sales * 100
-        shown = None if actual is None else f"{actual:.1f}% ({scope})"
+        name = "EBIT margin" if ebit else "EBITDA margin"
+        shown = None if actual is None else f"{name} {actual:.1f}% ({scope})"
         tol = 0.5
     else:  # absolute revenue in crore
         total = _sum(have, "sales")

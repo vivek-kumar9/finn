@@ -127,6 +127,8 @@ RESULTS_SCHEMA = {
     "required": ["basis", "unit", "is_bank", "periods"],
 }
 
+CHECK_TOLERANCE = 0.02  # 2%, or ₹1 cr for small numbers
+
 RESULTS_MODELS = [m for m in os.environ.get(
     "RESULTS_MODELS", "gemini-3.5-flash,gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-flash-latest"
 ).split(",") if m]
@@ -150,6 +152,35 @@ Copy numbers exactly as printed, in the table's own unit; losses are negative.
 - period_end as YYYY-MM-DD. page: the PDF page number of the table.
 Use null for anything not printed. Never estimate."""
 
+RESULTS_TEXT_SUFFIX = """
+
+You get the TEXT of the results pages, extracted from the PDF with its layout
+kept as spacing, not the PDF itself. Return JSON only, in this shape:
+{"basis": "consolidated|standalone", "unit": "crore|lakh|million|thousand|rupees",
+ "is_bank": false, "page": 1, "periods": [{"role": "current|previous_quarter|year_ago_quarter",
+ "period_end": "YYYY-MM-DD", "revenue": 0, "total_income": 0, "other_income": 0, "finance_costs": 0,
+ "depreciation": 0, "pbt_before_exceptional": 0, "pbt": 0, "pat": 0, "ebitda_reported": null,
+ "interest_earned": null, "interest_expended": null, "operating_profit": null}]}
+
+Page text:
+"""
+
+
+def _pages_text(pdf: bytes, limit: int = 14000) -> str:
+    try:
+        reader = PdfReader(io.BytesIO(pdf))
+        parts = []
+        for page in reader.pages:
+            try:
+                parts.append(page.extract_text(extraction_mode="layout") or "")
+            except TypeError:  # older pypdf
+                parts.append(page.extract_text() or "")
+        text = "\n\n".join(parts)
+        return text[:limit] if text.strip() else ""
+    except Exception:
+        return ""
+
+
 _TO_CRORE = {"crore": 1, "lakh": 0.01, "million": 0.1, "thousand": 1e-4, "rupees": 1e-7}
 
 
@@ -166,8 +197,36 @@ def _pct(now, before):
     return round((now - before) / abs(before) * 100, 1)
 
 
+def _number(v):
+    """Models sometimes return '1,234.5', '(12.3)' for a loss, or '-' for blank."""
+    if v is None or isinstance(v, (int, float)):
+        return v
+    t = str(v).strip().replace(",", "").replace("₹", "")
+    if t in ("", "-", "–", "—", "NA", "N/A", "nil"):
+        return None
+    neg = t.startswith("(") and t.endswith(")")
+    try:
+        n = float(t.strip("()"))
+    except ValueError:
+        return None
+    return -n if neg else n
+
+
+def _normalise(x: dict) -> dict:
+    x["is_bank"] = x.get("is_bank") in (True, "true", "True", 1)
+    x["unit"] = str(x.get("unit", "crore")).lower().rstrip("s")
+    for p in x.get("periods", []):
+        for key in list(p):
+            if key not in ("role", "period_end"):
+                p[key] = _number(p[key])
+    return x
+
+
 def results_card(x: dict, url: str) -> dict:
     """Pure arithmetic over the extracted table. Raises if the extraction is unusable."""
+    x = _normalise(x)
+    if x["unit"] not in _TO_CRORE:
+        raise ValueError(f"unknown unit {x['unit']!r}")
     k = _TO_CRORE[x["unit"]]
     periods = {p["role"]: p for p in x["periods"]}
     if "current" not in periods:
@@ -379,29 +438,123 @@ def generic_card(category: str, pdf: bytes | None, text: str, symbol: str, url: 
 
 # ---------------------------------------------------------------- driver
 
+class CheckFailed(ValueError):
+    pass
+
+
+def cross_check(card: dict, symbol: str, period_end: str) -> dict:
+    """Compare the extracted quarter with screener's table, compiled independently
+    from the same filings. Revenue and PAT must agree; for banks, PAT only,
+    since screener's bank revenue line is defined differently."""
+    from pipeline import screener
+
+    ref = screener.quarters(symbol, card["basis"]).get(period_end)
+    if not ref:
+        raise CheckFailed(f"screener has no {card['basis']} figures for the quarter ending {period_end}")
+    rows = {r["metric"]: r["value"] for r in card["rows"]}
+    pairs = [("PAT", rows.get("PAT"), ref.get("pat"))]
+    if not card["bank"]:
+        pairs.insert(0, ("Revenue", rows.get("Revenue"), ref.get("sales")))
+    for name, ours, theirs in pairs:
+        if ours is None or theirs is None:
+            raise CheckFailed(f"{name} missing on one side")
+        if abs(ours - theirs) > max(1.0, CHECK_TOLERANCE * abs(theirs)):
+            raise CheckFailed(f"{name} read as {ours:,.0f} but screener has {theirs:,.0f}")
+    return {"against": "screener", "metrics": [p[0] for p in pairs]}
+
+
 def build(story: dict, company: str) -> dict:
     cat, url = story["category"], story.get("lead_url")
     if cat == "results":
         if not url:
             raise ValueError("results story without a PDF")
         def extract():
+            """Full Flash models first, then Lite. Every reading must agree with
+            screener before it is kept; a failed reading is never cached, so a
+            better model can try again later."""
             pdf, pages = results_pages(download(url))
-            x = None
-            for i, model in enumerate(RESULTS_MODELS):
+            problems = []
+            disputed = []  # (model, x, card, why): complete readings screener disagrees with
+
+            def agreed():
+                """Two different models reading the same numbers is strong evidence of
+                what the filing prints, even when screener's table differs."""
+                for i, (m1, x1, c1, why) in enumerate(disputed):
+                    for m2, x2, c2, _ in disputed[i + 1:]:
+                        a = {r["metric"]: r["value"] for r in c1["rows"]}
+                        b = {r["metric"]: r["value"] for r in c2["rows"]}
+                        keys = [m for m in ("Revenue", "NII", "PAT") if a.get(m) is not None]
+                        if keys and all(b.get(m) is not None and abs(a[m] - b[m]) <= 0.005 * abs(b[m]) + 0.5
+                                        for m in keys):
+                            x1["_check"] = {"against": "screener", "metrics": [], "disputed": why,
+                                            "readers": [m1, m2]}
+                            x1["_model"] = m1
+                            return x1
+                return None
+            for model in RESULTS_MODELS + llm.GEMINI_FALLBACKS:
                 try:
                     x = llm.gemini_json(RESULTS_PROMPT, purpose="results", model=model, fallback=False,
                                         pdf=pdf, schema=RESULTS_SCHEMA)
-                    break
                 except (llm.QuotaExhausted, llm.ModelUnavailable):
-                    if i == len(RESULTS_MODELS) - 1:
-                        raise
-            # The model numbers pages within the excerpt; map back to the filing.
-            if x.get("page") and 1 <= x["page"] <= len(pages):
-                x["page"] = pages[x["page"] - 1]
-            return x
+                    continue
+                # The model numbers pages within the excerpt; map back to the filing.
+                if x.get("page") and 1 <= x["page"] <= len(pages):
+                    x["page"] = pages[x["page"] - 1]
+                try:
+                    card = results_card(x, url)
+                    current = next(p for p in x["periods"] if p["role"] == "current")
+                    x["_check"] = cross_check(card, story["symbol"], current["period_end"])
+                    x["_model"] = model
+                    return x
+                except CheckFailed as e:
+                    problems.append(f"{model}: {e}")
+                    disputed.append((model, x, card, str(e)))
+                    if (hit := agreed()) is not None:
+                        return hit
+                except (ValueError, KeyError, StopIteration) as e:  # incomplete or malformed table
+                    problems.append(f"{model}: {e}")
+            # Last resort, no Gemini: the table pages' own text to Groq's largest
+            # model. Text loses the column layout, so this reading has to pass
+            # exactly the same completeness check and screener cross-check.
+            text = _pages_text(pdf)
+            if text:
+                try:
+                    x = llm.groq_json(RESULTS_PROMPT + RESULTS_TEXT_SUFFIX + text, purpose="results",
+                                      model=llm.GROQ_LARGE)
+                    x["page"] = pages[0] if pages else None
+                    card = results_card(x, url)
+                    current = next(p for p in x["periods"] if p["role"] == "current")
+                    x["_check"] = cross_check(card, story["symbol"], current["period_end"])
+                    x["_model"] = llm.GROQ_LARGE
+                    return x
+                except CheckFailed as e:
+                    problems.append(f"{llm.GROQ_LARGE}: {e}")
+                    disputed.append((llm.GROQ_LARGE, x, card, str(e)))
+                    if (hit := agreed()) is not None:
+                        return hit
+                except (ValueError, KeyError, StopIteration, TypeError) as e:
+                    problems.append(f"{llm.GROQ_LARGE}: {e}")
+                except Exception as e:  # rate limits and the like: try again on a later run
+                    raise llm.ModelUnavailable(f"groq: {e}") from e
+            if problems:
+                raise ValueError("; ".join(problems)[:400])
+            raise llm.QuotaExhausted("no model free to read results")
 
         x = llm.cached([url, PROMPT_VERSION, "results"], extract)
-        return results_card(x, url)
+        card = results_card(x, url)
+        card["model"] = x.get("_model")
+        card["check"] = x.get("_check")
+        if card["check"] and card["check"].get("disputed"):
+            card["checks"].append(f"Two independent readings of the filing agree, but screener differs: "
+                                  f"{card['check']['disputed']}.")
+            card["check"] = None
+        if card["check"] is None:  # read before cross-checking existed: check it now, no model call
+            current = next(p for p in x["periods"] if p["role"] == "current")
+            try:
+                card["check"] = cross_check(card, story["symbol"], current["period_end"])
+            except ValueError as e:
+                card["checks"].append(f"Not confirmed against screener: {e}.")
+        return card
     if cat == "management_change":
         if not url:
             raise ValueError("management change without a PDF")

@@ -102,6 +102,20 @@ def fetch(symbol: str) -> dict:
     return page
 
 
+def quarters(symbol: str, basis: str) -> dict[str, dict]:
+    """Quarter-end date → {sales, pat} from the consolidated or standalone page."""
+    key = f"{symbol.upper()}:{basis}"
+    hit = _cache.get(key)
+    if hit and time.time() - hit[0] < TTL:
+        return hit[1]
+    variant = "consolidated/" if basis == "consolidated" else ""
+    r = requests.get(f"{BASE}/company/{symbol.upper()}/{variant}", headers={"User-Agent": UA}, timeout=20)
+    r.raise_for_status()
+    out = {q["end"]: q for q in parse(r.text)["quarters"]}
+    _cache[key] = (time.time(), out)
+    return out
+
+
 def parse(html: str) -> dict:
     soup = BeautifulSoup(html, "lxml")
     h1 = soup.find("h1")
@@ -118,12 +132,14 @@ def parse(html: str) -> dict:
         sales = _pick(q["rows"], "Sales", "Revenue")
         op = _pick(q["rows"], "Operating Profit", "Financing Profit")
         pat = _pick(q["rows"], "Net Profit")
+        dep = _pick(q["rows"], "Depreciation")
         for i, col in enumerate(q["columns"]):
             end = _month_end(col)
             if end and sales:
                 quarters.append({
                     "end": end.isoformat(), "sales": sales[i],
                     "op_profit": op[i] if op else None, "pat": pat[i] if pat else None,
+                    "depreciation": dep[i] if dep else None,
                 })
 
     annual = _table(soup, "profit-loss")

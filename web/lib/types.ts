@@ -17,6 +17,7 @@ export type ResultsCard = {
   margins: Record<string, { now: number; qoq_bps: number | null; yoy_bps: number | null }>;
   source: { url: string; page?: number | null };
   checks: string[];
+  check?: { against: string; metrics: string[] } | null;
 };
 
 export type Person = {

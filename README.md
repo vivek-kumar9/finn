@@ -58,7 +58,17 @@ Models read; code decides. Every number shown is computed in Python from a prima
 
 Cost controls: every model output is cached by document URL and prompt version, so a repeat view costs nothing; free-tier daily quotas are per model, so calls move down a chain of models when one runs out, and stories wait for the next hourly run rather than showing a half-read table.
 
-<!-- numbers from the live system: fill in from the evening run -->
+## In numbers
+
+From the live system on 9 November 2026 (`python scripts/stats.py`):
+
+- **252** NSE filings across the 18 holdings over 30 days. **231 (92%)** classified by rules; 21 needed a model.
+- **133** stories. 56 got a card; 68 routine items were collapsed without any model call.
+- **27** earnings-call transcripts read across 7 companies. **64** guidance quotes kept; **3 (4%)** dropped because their words were not in the transcript.
+- **123** model calls and **615k** tokens to build all of the above, 58% of them spent reading transcripts. Cost: **₹0** on free tiers.
+- A repeat research view: **0** model calls, about **5 seconds**.
+
+The free tier shaped the build. Gemini's daily quota is roughly 20 requests per model, and on the build day every full Flash model was either spent or overloaded by evening: 18 of the 27 transcripts were read by Flash-Lite through the fallback chain, and 8 results cards were left pending rather than built by a weaker model. They are picked up by the hourly job once the quota resets.
 
 ## Judgment calls
 

@@ -47,6 +47,9 @@ export function ResultsGrid({ card }: { card: ResultsCard }) {
         </a>
         {card.ebitda_derived && <span> d: EBITDA derived from the filing&rsquo;s lines</span>}
       </p>
+      {card.check && (
+        <p className="source">{card.check.metrics.join(" and ")} match screener&rsquo;s quarterly table.</p>
+      )}
     </div>
   );
 }

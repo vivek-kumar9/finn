@@ -5,7 +5,7 @@ from pipeline.guidance import Promise, Quarter, judge, ledger, verify
 
 
 def q(y, m, d, sales, op, pat):
-    return Quarter(date(y, m, d), sales, op, pat)
+    return Quarter(date(y, m, d), sales, op, pat, depreciation=3)
 
 
 # FY26 and the first half of FY27
@@ -34,7 +34,7 @@ def test_growth_under_way_is_judged_on_ytd():
 
 
 def test_finished_period_is_met_or_missed():
-    assert judge(promise("ebitda_margin", "Q2 FY27", 16), QUARTERS).status == "met"  # 16.4%
+    assert judge(promise("ebitda_margin", "Q2 FY27", 16), QUARTERS).status == "met"  # 16.4% before depreciation
     assert judge(promise("ebitda_margin", "Q2 FY27", 17), QUARTERS).status == "missed"
     assert judge(promise("ebitda_margin", "Q2 FY27", 16.6), QUARTERS).status == "met"  # within half a point
 
@@ -83,3 +83,21 @@ def test_two_statements_on_one_call_are_not_a_revision():
     b = {**a, "promise": "Smart metering order book ₹4,000 cr", "low": 4000, "high": None}
     rows = ledger([{"call_period": "Q3 FY26", "url": "u", "items": [b, a]}], QUARTERS)
     assert len(rows) == 2 and all(r["revisions"] == [] for r in rows)
+
+
+def test_constant_currency_guidance_is_not_judged_on_rupee_revenue():
+    # Infosys guides growth in constant currency; rupee growth includes currency and acquisitions.
+    p = promise("revenue_growth", "FY27", 1, 2)
+    p.promise, p.quote = "Revenue growth 1% to 2% in constant currency", "1% to 2% YoY in constant currency terms"
+    v = judge(p, QUARTERS)
+    assert v.status == "unverifiable" and "constant currency" in v.basis
+
+
+def test_operating_margin_means_ebit():
+    # Q2 FY27: op 21, depreciation 3, sales 128 → EBIT 14.1%, EBITDA 16.4%
+    p = promise("ebitda_margin", "Q2 FY27", 15)
+    p.promise, p.quote = "Operating margin of 15%", "operating margin should be about 15%"
+    v = judge(p, QUARTERS)
+    assert v.status == "missed" and v.actual.startswith("EBIT margin 14.1%")
+    p.promise, p.quote = "EBITDA margin of 15%", "EBITDA margin around 15%"
+    assert judge(p, QUARTERS).status == "met"

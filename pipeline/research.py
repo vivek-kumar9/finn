@@ -302,7 +302,8 @@ def run(symbol: str) -> Iterator[tuple[str, dict]]:
 
     # Promised vs delivered over the last four calls, oldest first.
     calls_meta = [c for c in page["concalls"] if c.get("transcript")][:4][::-1]
-    quarters = [guidance.Quarter(date.fromisoformat(q["end"]), q["sales"], q["op_profit"], q["pat"])
+    quarters = [guidance.Quarter(date.fromisoformat(q["end"]), q["sales"], q["op_profit"], q["pat"],
+                                 q.get("depreciation"))
                             for q in page["quarters"]]
     if not calls_meta:
         decks = sum(1 for c in page["concalls"] if c.get("ppt"))

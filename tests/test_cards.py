@@ -72,3 +72,41 @@ def test_half_read_table_is_rejected():
     x["periods"] = [x["periods"][0]]  # current column only: no QoQ or YoY possible
     with pytest.raises(ValueError, match="incomplete"):
         results_card(x, "r.pdf")
+
+
+def test_cross_check_rejects_a_misread(monkeypatch):
+    from pipeline import cards, screener
+
+    card = results_card(extraction(), "r.pdf")  # revenue 1,200 cr, PAT 150 cr
+    monkeypatch.setattr(screener, "quarters", lambda sym, basis: {"2026-09-30": {"sales": 1201.0, "pat": 150.0}})
+    assert cards.cross_check(card, "X", "2026-09-30")["metrics"] == ["Revenue", "PAT"]
+    monkeypatch.setattr(screener, "quarters", lambda sym, basis: {"2026-09-30": {"sales": 1200.0, "pat": 120.0}})
+    with pytest.raises(cards.CheckFailed, match="PAT read as 150"):
+        cards.cross_check(card, "X", "2026-09-30")
+
+
+def test_numbers_returned_as_text_are_understood():
+    x = extraction()
+    for p in x["periods"]:
+        p["revenue"], p["pat"] = f"{p['revenue']:,}", str(p["pat"])
+    x["periods"][1]["pbt"] = "(500)"  # a loss in brackets
+    rows = {r["metric"]: r for r in results_card(x, "r.pdf")["rows"]}
+    assert rows["Revenue"]["value"] == 1200.0 and rows["PBT"]["qoq"] is None
+
+
+def test_two_models_agreeing_against_screener_is_shown_with_a_flag(monkeypatch):
+    from pipeline import cards, llm, screener
+
+    reading = extraction(unit="crore")  # revenue 120000 cr, PAT 15000 cr
+    monkeypatch.setattr(cards, "download", lambda url: b"%PDF")
+    monkeypatch.setattr(cards, "results_pages", lambda pdf: (b"%PDF", [3]))
+    monkeypatch.setattr(cards, "_pages_text", lambda pdf: "")
+    monkeypatch.setattr(cards, "RESULTS_MODELS", ["a", "b"])
+    monkeypatch.setattr(llm, "GEMINI_FALLBACKS", [])
+    monkeypatch.setattr(llm, "gemini_json", lambda *a, **k: __import__("copy").deepcopy(reading))
+    monkeypatch.setattr(llm, "cached", lambda key, fn, stats=None: fn())
+    monkeypatch.setattr(screener, "quarters", lambda s, b: {"2026-09-30": {"sales": 110000.0, "pat": 15000.0}})
+
+    card = cards.build({"category": "results", "lead_url": "u", "symbol": "X", "id": "X:results:1"}, "X Ltd")
+    assert card["check"] is None
+    assert any("screener differs" in c for c in card["checks"])
