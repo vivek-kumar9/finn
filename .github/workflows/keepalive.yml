@@ -1,0 +1,15 @@
+name: keepalive
+
+# Render's free tier sleeps after 15 idle minutes and takes ~50 s to wake,
+# which makes the first Telegram reply and the first research run slow.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - run: curl -fsS --retry 2 --max-time 90 "${{ secrets.FINN_API_URL }}/health"

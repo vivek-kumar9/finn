@@ -302,7 +302,11 @@ def run(symbol: str) -> Iterator[tuple[str, dict]]:
     quarters = [guidance.Quarter(date.fromisoformat(q["end"]), q["sales"], q["op_profit"], q["pat"])
                             for q in page["quarters"]]
     if not calls_meta:
-        yield "ledger", {"rows": [], "calls": [], "note": "No concall transcripts are linked for this company."}
+        decks = sum(1 for c in page["concalls"] if c.get("ppt"))
+        note = (f"{page['name'] or symbol} doesn't publish earnings-call transcripts; only investor presentations "
+                f"are filed ({decks} quarters). With nothing management said on record, there are no promises to check."
+                if decks else "No earnings-call transcripts are filed for this company, so there are no promises to check.")
+        yield "ledger", {"rows": [], "calls": [], "note": note}
     if calls_meta:
         yield "progress", {"text": f"Reading the last {len(calls_meta)} earnings calls"}
     # Transcripts are independent, so they're read side by side; each one is
