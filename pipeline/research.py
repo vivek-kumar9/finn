@@ -160,7 +160,7 @@ def facts(n: dict) -> list[dict]:
         add(f"Net profit grew {g['pat_3y']}% a year over 3 years")
     a = [x for x in n["annual"] if x["opm"] is not None]
     if len(a) >= 3:
-        add(f"Operating margin {a[-1]['opm']}% in {a[-1]['label']} vs {a[-3]['opm']}% in {a[-3]['label']}")
+        add(f"EBITDA margin (before depreciation) {a[-1]['opm']}% in {a[-1]['label']} vs {a[-3]['opm']}% in {a[-3]['label']}")
     q = n["quarters"]
     if len(q) >= 5 and q[-1]["sales"] and q[-5]["sales"]:
         add(f"Latest quarter ({q[-1]['label']}) revenue {((q[-1]['sales'] / q[-5]['sales']) - 1) * 100:+.1f}% YoY")

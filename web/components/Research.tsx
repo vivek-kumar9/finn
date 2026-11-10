@@ -258,7 +258,7 @@ function Trajectory({ n }: { n: Numbers }) {
       </p>
       <Bars values={q.map((x) => x.sales)} labels={q.map((x) => x.label)} />
       <table className="num">
-        <thead><tr><th scope="col"><span className="sr">Quarter</span></th><th scope="col">{top}</th><th scope="col">{n.bank ? "Margin" : "OPM"}</th><th scope="col">PAT</th></tr></thead>
+        <thead><tr><th scope="col"><span className="sr">Quarter</span></th><th scope="col">{top}</th><th scope="col">{n.bank ? "Margin" : "EBITDA %"}</th><th scope="col">PAT</th></tr></thead>
         <tbody>
           {[...q].reverse().map((x) => (
             <tr key={x.label}><th scope="row">{x.label}</th><td>{crore(x.sales)}</td><td>{x.opm != null ? `${x.opm}%` : "–"}</td><td>{crore(x.pat)}</td></tr>
