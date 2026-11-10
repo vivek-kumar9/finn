@@ -49,7 +49,7 @@ Models read; code decides. Every number shown is computed in Python from a prima
 | Job | Model | Why |
 | --- | --- | --- |
 | Filing category | Rules first (92% of filings), Groq `gpt-oss-20b` for the rest | Most NSE subjects are formulaic; a label is an easy task |
-| Results table → 4 metrics × 3 periods | Gemini 3.5 Flash, then other full Flash models | Table reading needs the stronger model; Lite misread tables in testing, so it is never used here |
+| Results table → 4 metrics × 3 periods | Gemini 3.5 Flash, other full Flash models, then Lite and Groq (on the page text) | Every reading must match screener's quarterly table; a weaker reader's work is kept only if it does |
 | Page finding for results | None: pypdf scores pages on line items | Large filings put the table on page 12+; only those pages are sent |
 | Leadership, other filings, bios | Gemini Flash-Lite | Short, factual extraction |
 | Guidance from transcripts | Full Flash, Lite as fallback | Prose, and every quote is verified afterwards |
@@ -60,15 +60,18 @@ Cost controls: every model output is cached by document URL and prompt version, 
 
 ## In numbers
 
-From the live system on 9 November 2026 (`python scripts/stats.py`):
+From the live system on 10 November 2026 (`python scripts/stats.py`):
 
-- **252** NSE filings across the 18 holdings over 30 days. **231 (92%)** classified by rules; 21 needed a model.
-- **133** stories. 56 got a card; 68 routine items were collapsed without any model call.
+- **256** NSE filings across the 18 holdings over 30 days. **235 (92%)** classified by rules; 21 needed a model.
+- **134** stories. 63 got a card; 69 routine items were collapsed without any model call.
+- **14 of 16** results stories have a grid that matches screener's quarterly table. The other two point to the filing: ETERNAL's results PDF was filed under a subject that landed in a different story, and no reader, full Gemini Flash included, could pull a complete table from PERSISTENT's PDF.
 - **27** earnings-call transcripts read across 7 companies. **64** guidance quotes kept; **3 (4%)** dropped because their words were not in the transcript.
-- **123** model calls and **615k** tokens to build all of the above, 58% of them spent reading transcripts. Cost: **₹0** on free tiers.
+- **185** model calls and **806k** tokens to build all of the above, 44% of them spent reading transcripts. Cost: **₹0** on free tiers.
 - A repeat research view: **0** model calls, about **5 seconds**.
 
-The free tier shaped the build. Gemini's daily quota is roughly 20 requests per model, and on the build day every full Flash model was either spent or overloaded by evening: 18 of the 27 transcripts were read by Flash-Lite through the fallback chain, and 8 results cards were left pending rather than built by a weaker model. They are picked up by the hourly job once the quota resets.
+The cross-check earned its place. It caught a model reading CDSL's total income (₹417 cr) as revenue (₹394 cr), and Titan's standalone table labelled as consolidated, which is now relabelled rather than rejected.
+
+The free tier shaped the build. Gemini's daily quota is roughly 20 requests per model, and on the build day every full Flash model was spent or overloaded by evening, so 18 of the 27 transcripts were read by Flash-Lite through the fallback chain. Results tables are held to a stricter rule: a Lite or Groq reading is kept only if it matches screener.
 
 ## Judgment calls
 
