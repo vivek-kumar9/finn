@@ -285,6 +285,8 @@ def results_card(x: dict, url: str) -> dict:
         raise ValueError("revenue missing or non-positive")
     if now.get(bottom) is None or not prev and not ago:
         raise ValueError("incomplete table: need PAT and at least one comparison column")
+    if now.get("PBT") is None:
+        raise ValueError("incomplete table: PBT missing")
     if all(r["qoq"] is None and r["yoy"] is None for r in rows if r["metric"] == top):
         raise ValueError("incomplete table: no comparison for the top line")
     if now.get("PBT") and now.get("PAT") and now["PBT"] > 0 and now["PAT"] > now["PBT"] * 1.3:
@@ -562,8 +564,15 @@ def build(story: dict, company: str) -> dict:
                 raise ValueError("; ".join(problems)[:400])
             raise llm.QuotaExhausted("no model free to read results")
 
-        x = llm.cached([url, PROMPT_VERSION, "results"], extract)
-        card = results_card(x, url)
+        key = [url, PROMPT_VERSION, "results"]
+        x = llm.cached(key, extract)
+        try:
+            card = results_card(x, url)
+        except ValueError:
+            # Read before the current checks existed and fails them now: read again.
+            llm.forget(key)
+            x = llm.cached(key, extract)
+            card = results_card(x, url)
         if (x.get("_check") or {}).get("relabelled"):
             card["basis"] = x["_check"]["relabelled"].split(" → ")[1]
         card["model"] = x.get("_model")
@@ -572,7 +581,7 @@ def build(story: dict, company: str) -> dict:
             card["checks"].append(f"Two independent readings of the filing agree, but screener differs: "
                                   f"{card['check']['disputed']}.")
             card["check"] = None
-        if card["check"] is None:  # read before cross-checking existed: check it now, no model call
+        if "_check" not in x:  # read before cross-checking existed: check it now, no model call
             current = next(p for p in x["periods"] if p["role"] == "current")
             try:
                 card["check"] = cross_check(card, story["symbol"], current["period_end"])

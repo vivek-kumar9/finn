@@ -162,6 +162,16 @@ def _gemini(prompt: str, purpose: str, model: str,
     raise RuntimeError(f"gemini {model}: out of retries")
 
 
+def forget(key_parts: list[str]):
+    """Drop a stored output, e.g. one that no longer passes stricter checks."""
+    import hashlib
+
+    from pipeline import db
+
+    key = hashlib.sha256("|".join(key_parts).encode()).hexdigest()
+    db.client().table("research_cache").delete().eq("key", key).execute()
+
+
 def cached(key_parts: list[str], fn, stats: dict | None = None):
     """Return a stored model output for these inputs, or compute and store it.
     stats, if given, counts hits and misses for the caller's cost line."""
