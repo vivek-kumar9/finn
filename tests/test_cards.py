@@ -105,6 +105,8 @@ def test_two_models_agreeing_against_screener_is_shown_with_a_flag(monkeypatch):
     monkeypatch.setattr(llm, "GEMINI_FALLBACKS", [])
     monkeypatch.setattr(llm, "gemini_json", lambda *a, **k: __import__("copy").deepcopy(reading))
     monkeypatch.setattr(llm, "cached", lambda key, fn, stats=None: fn())
+    monkeypatch.setattr(llm, "lookup", lambda key: None)
+    monkeypatch.setattr(cards, "pick_results_pdf", lambda story: ("u", b"%PDF"))
     monkeypatch.setattr(screener, "quarters", lambda s, b: {"2026-09-30": {"sales": 110000.0, "pat": 15000.0}})
 
     card = cards.build({"category": "results", "lead_url": "u", "symbol": "X", "id": "X:results:1"}, "X Ltd")
@@ -121,3 +123,106 @@ def test_standalone_table_read_as_consolidated_is_relabelled(monkeypatch):
     monkeypatch.setattr(screener, "quarters", lambda sym, basis: tables[basis])
     check = cards.cross_check(card, "TITAN", "2026-09-30")
     assert card["basis"] == "standalone" and check["relabelled"] == "consolidated → standalone"
+
+
+def test_pbt_is_derived_from_pat_and_tax_when_not_printed():
+    x = extraction()
+    for p in x["periods"]:
+        p["tax_expense"], p["pbt"], p["pbt_before_exceptional"] = p["pbt"] - p["pat"], None, None
+    card = results_card(x, "r.pdf")
+    rows = {r["metric"]: r for r in card["rows"]}
+    assert rows["PBT"]["value"] == 200.0 and card["sourced"]["PBT"] == "derived"
+
+
+def test_missing_pbt_is_rejected_without_a_fill():
+    x = extraction()
+    for p in x["periods"]:
+        p["pbt"], p["pbt_before_exceptional"] = None, None
+    with pytest.raises(ValueError, match="PBT missing"):
+        results_card(x, "r.pdf")
+
+
+def _build_with(monkeypatch, reading, table):
+    from pipeline import cards, llm, screener
+
+    monkeypatch.setattr(cards, "download", lambda url: b"%PDF")
+    monkeypatch.setattr(cards, "results_pages", lambda pdf: (b"%PDF", [3]))
+    monkeypatch.setattr(cards, "_pages_text", lambda pdf: "")
+    monkeypatch.setattr(cards, "RESULTS_MODELS", ["a"])
+    monkeypatch.setattr(llm, "GEMINI_FALLBACKS", [])
+    monkeypatch.setattr(llm, "gemini_json", lambda *a, **k: __import__("copy").deepcopy(reading))
+    monkeypatch.setattr(llm, "cached", lambda key, fn, stats=None: fn())
+    monkeypatch.setattr(llm, "lookup", lambda key: None)
+    monkeypatch.setattr(cards, "pick_results_pdf", lambda story: ("u", b"%PDF"))
+    monkeypatch.setattr(screener, "quarters", lambda s, b: table)
+    return cards.build({"category": "results", "lead_url": "u", "symbol": "X", "id": "X:results:1"}, "X Ltd")
+
+
+def test_unread_pbt_comes_from_screener_only_after_revenue_and_pat_match(monkeypatch):
+    reading = extraction(unit="crore")
+    for p in reading["periods"]:
+        p["pbt"] = p["pbt_before_exceptional"] = p["finance_costs"] = None
+    table = {"2026-09-30": {"sales": 120000.0, "pat": 15000.0, "pbt": 20000.0, "op_profit": 22000.0},
+             "2026-06-30": {"sales": 100000.0, "pat": 11000.0, "pbt": 15000.0, "op_profit": 17000.0},
+             "2025-09-30": {"sales": 96000.0, "pat": 9000.0, "pbt": 12000.0, "op_profit": 13500.0}}
+    card = _build_with(monkeypatch, reading, table)
+    rows = {r["metric"]: r for r in card["rows"]}
+    assert rows["PBT"]["value"] == 20000.0 and rows["PBT"]["qoq"] == pytest.approx(33.3, abs=0.1)
+    assert card["sourced"] == {"PBT": "screener", "EBITDA": "screener"} and not card["ebitda_derived"]
+
+    table["2026-09-30"]["pat"] = 14000.0  # PAT disagrees: nothing is borrowed, the card fails
+    with pytest.raises(ValueError, match="PAT read as"):
+        _build_with(monkeypatch, reading, table)
+
+
+SCREENER_1200 = {"2026-09-30": {"sales": 1200.0, "pat": 150.0, "pbt": 200.0},
+                 "2026-06-30": {"sales": 1000.0, "pat": 110.0, "pbt": 150.0},
+                 "2025-09-30": {"sales": 960.0, "pat": 90.0, "pbt": 120.0}}
+
+
+def test_unit_names_are_understood():
+    x = extraction(unit="Rupees")
+    for p in x["periods"]:
+        for key in ("revenue", "pbt", "pat"):
+            p[key] *= 100_000  # the lakh fixture, in rupees
+    rows = {r["metric"]: r for r in results_card(x, "r.pdf")["rows"]}
+    assert rows["Revenue"]["value"] == 1200.0
+
+
+def test_unstated_unit_is_the_scale_that_matches_screener(monkeypatch):
+    card = _build_with(monkeypatch, extraction(unit="none"), SCREENER_1200)
+    assert {r["metric"]: r["value"] for r in card["rows"]}["Revenue"] == 1200.0
+    assert any("unit not stated" in c.lower() for c in card["checks"])
+
+
+def test_total_income_taken_for_revenue_is_repaired(monkeypatch):
+    reading = extraction()
+    for p in reading["periods"]:
+        p["other_income"] = 7000  # about 6%, as in CDSL's ₹417 cr against ₹394 cr
+        p["total_income"] = p["revenue"] = p["revenue"] + p["other_income"]
+    card = _build_with(monkeypatch, reading, SCREENER_1200)
+    assert {r["metric"]: r["value"] for r in card["rows"]}["Revenue"] == 1200.0
+    assert any("total income for revenue" in c for c in card["checks"])
+
+
+def test_statement_beats_press_release_and_deck():
+    from pipeline.cards import statement_strength
+    from tests.test_results_pages import pdf
+
+    press = pdf(["Media release\nTotal Income 417 341 22%\nNet profit 173 118 47%"])
+    deck = pdf(["Earnings presentation\nRevenue growth 53% YoY\nEBITDA margin\nPAT margin"])
+    statement = pdf(["Statement of consolidated results\nQuarter ended 30.09.2026\nRevenue from operations\n"
+                     "Other income\nTotal expenses\nFinance costs\nDepreciation\nProfit before tax\n"
+                     "Tax expense\nEarnings per share"])
+    assert statement_strength(statement) >= 7 > statement_strength(press) and statement_strength(deck) < 3
+
+
+def test_misstated_unit_is_corrected_only_when_both_lines_match(monkeypatch):
+    reading = extraction(unit="crore")  # the lakh fixture, claimed as crore: 100x too big
+    card = _build_with(monkeypatch, reading, SCREENER_1200)
+    assert {r["metric"]: r["value"] for r in card["rows"]}["Revenue"] == 1200.0
+    assert any("took the table to be in crore" in c for c in card["checks"])
+
+    wrong_pat = {k: dict(v, pat=v["pat"] * 2) for k, v in SCREENER_1200.items()}
+    with pytest.raises(ValueError, match="Revenue read as 120,000"):
+        _build_with(monkeypatch, extraction(unit="crore"), wrong_pat)

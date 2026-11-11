@@ -162,6 +162,17 @@ def _gemini(prompt: str, purpose: str, model: str,
     raise RuntimeError(f"gemini {model}: out of retries")
 
 
+def lookup(key_parts: list[str]):
+    """A stored output, or None. Never computes."""
+    import hashlib
+
+    from pipeline import db
+
+    key = hashlib.sha256("|".join(key_parts).encode()).hexdigest()
+    hit = db.client().table("research_cache").select("value").eq("key", key).execute().data
+    return hit[0]["value"] if hit else None
+
+
 def forget(key_parts: list[str]):
     """Drop a stored output, e.g. one that no longer passes stricter checks."""
     import hashlib

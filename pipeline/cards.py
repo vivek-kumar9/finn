@@ -6,6 +6,7 @@ investor compares (QoQ, YoY, margins, yields) is computed here.
     python -m pipeline.cards --limit 50
 """
 import argparse
+import copy
 import io
 import os
 from datetime import date
@@ -17,6 +18,9 @@ from pipeline import db, llm
 from pipeline.nse import UA
 from pipeline.stories import WEIGHT
 
+# Bump to re-read everything. Not bumped for the tax and exceptional-items
+# fields: readings that already pass need neither, and failed readings are never
+# cached, so only the failures are read again with the new prompt.
 PROMPT_VERSION = "cards-v4"
 MIN_WEIGHT = 4  # below this a story stays a one-line routine item
 
@@ -64,6 +68,30 @@ def fetch_pdf(url: str, max_pages: int) -> bytes:
 
 _TABLE_MARKS = ("revenue from operations", "interest earned", "profit before tax",
                 "quarter ended", "three months ended")
+# Lines a statutory results statement prints and a press release or investor
+# deck usually doesn't. Used to choose which of a story's PDFs to read.
+_STATEMENT_MARKS = ("revenue from operations", "interest earned", "other income", "total expenses",
+                    "finance cost", "depreciation", "profit before tax", "tax expense",
+                    "earnings per share", "quarter ended", "three months ended")
+
+
+def _page_texts(content: bytes) -> list[str]:
+    try:
+        reader = PdfReader(io.BytesIO(content))
+    except Exception:
+        return []
+    texts = []
+    for page in reader.pages:
+        try:
+            texts.append(" ".join((page.extract_text() or "").lower().split()))
+        except Exception:
+            texts.append("")
+    return texts
+
+
+def statement_strength(content: bytes) -> int:
+    """How many statement line items the best page carries (0 for a scan)."""
+    return max((sum(m in t for m in _STATEMENT_MARKS) for t in _page_texts(content)), default=0)
 
 
 def results_pages(content: bytes, max_pages: int = 4) -> tuple[bytes, list[int]]:
@@ -76,11 +104,7 @@ def results_pages(content: bytes, max_pages: int = 4) -> tuple[bytes, list[int]]
     """
     reader = PdfReader(io.BytesIO(content))
     scores = []
-    for i, page in enumerate(reader.pages):
-        try:
-            text = " ".join((page.extract_text() or "").lower().split())
-        except Exception:
-            text = ""
+    for i, text in enumerate(_page_texts(content)):
         score = sum(mark in text for mark in _TABLE_MARKS)
         if score >= 3:
             scores.append((score + 0.5 * ("consolidated" in text), i))
@@ -117,7 +141,8 @@ RESULTS_SCHEMA = {
                     "role": {"type": "STRING", "enum": ["current", "previous_quarter", "year_ago_quarter"]},
                     "period_end": {"type": "STRING"},
                     "revenue": _N, "total_income": _N, "other_income": _N, "finance_costs": _N, "depreciation": _N,
-                    "pbt_before_exceptional": _N, "pbt": _N, "pat": _N, "ebitda_reported": _N,
+                    "pbt_before_exceptional": _N, "exceptional_items": _N, "pbt": _N,
+                    "tax_expense": _N, "pat": _N, "ebitda_reported": _N,
                     "interest_earned": _N, "interest_expended": _N, "operating_profit": _N,
                 },
                 "required": ["role", "period_end"],
@@ -145,7 +170,12 @@ Copy numbers exactly as printed, in the table's own unit; losses are negative.
   services" followed by a GST line; use the line after GST is deducted.
 - total_income: the total income line
 - pbt_before_exceptional: profit before exceptional items and tax (null if no such line)
-- pbt: profit before tax; pat: profit for the period (before other comprehensive income)
+- exceptional_items: the exceptional items line, negative if it is a charge (null if none)
+- pbt: profit before tax. Older formats call it "profit from ordinary activities
+  before tax"; a table may print it as "profit before share of associates and tax"
+  followed by the share, in which case use the line after the share is added.
+- tax_expense: total tax expense (current + deferred + earlier years); a credit is negative
+- pat: profit for the period (before other comprehensive income)
 - ebitda_reported: only if the table prints EBITDA
 - For banks set is_bank and fill interest_earned, interest_expended and operating_profit
   (operating profit before provisions and contingencies).
@@ -159,7 +189,8 @@ kept as spacing, not the PDF itself. Return JSON only, in this shape:
 {"basis": "consolidated|standalone", "unit": "crore|lakh|million|thousand|rupees",
  "is_bank": false, "page": 1, "periods": [{"role": "current|previous_quarter|year_ago_quarter",
  "period_end": "YYYY-MM-DD", "revenue": 0, "total_income": 0, "other_income": 0, "finance_costs": 0,
- "depreciation": 0, "pbt_before_exceptional": 0, "pbt": 0, "pat": 0, "ebitda_reported": null,
+ "depreciation": 0, "pbt_before_exceptional": 0, "exceptional_items": null, "pbt": 0,
+ "tax_expense": 0, "pat": 0, "ebitda_reported": null,
  "interest_earned": null, "interest_expended": null, "operating_profit": null}]}
 
 Page text:
@@ -182,6 +213,10 @@ def _pages_text(pdf: bytes, limit: int = 14000) -> str:
 
 
 _TO_CRORE = {"crore": 1, "lakh": 0.01, "million": 0.1, "thousand": 1e-4, "rupees": 1e-7}
+# Compared after lower-casing and stripping a trailing "s", so "Crores" is "crore".
+_UNIT_NAMES = {"crore": "crore", "cr": "crore", "lakh": "lakh", "lac": "lakh", "lacs": "lakh",
+               "million": "million", "mn": "million", "thousand": "thousand", "000": "thousand",
+               "rupee": "rupees", "rupees": "rupees", "r": "rupees", "inr": "rupees", "rs": "rupees"}
 
 
 def fiscal_quarter(period_end: str) -> str:
@@ -214,7 +249,7 @@ def _number(v):
 
 def _normalise(x: dict) -> dict:
     x["is_bank"] = x.get("is_bank") in (True, "true", "True", 1)
-    x["unit"] = str(x.get("unit", "crore")).lower().rstrip("s")
+    x["unit"] = _UNIT_NAMES.get(str(x.get("unit") or "").lower().strip(" .s"), "unknown")
     for p in x.get("periods", []):
         for key in list(p):
             if key not in ("role", "period_end"):
@@ -222,8 +257,12 @@ def _normalise(x: dict) -> dict:
     return x
 
 
-def results_card(x: dict, url: str) -> dict:
-    """Pure arithmetic over the extracted table. Raises if the extraction is unusable."""
+def results_card(x: dict, url: str, need_pbt: bool = True) -> dict:
+    """Pure arithmetic over the extracted table. Raises if the extraction is unusable.
+
+    x["_fill"], when present, holds screener's figures for lines the reader
+    couldn't find; they are used only where the filing's own value is missing,
+    and the card says which ones they are."""
     x = _normalise(x)
     if x["unit"] not in _TO_CRORE:
         raise ValueError(f"unknown unit {x['unit']!r}")
@@ -231,32 +270,53 @@ def results_card(x: dict, url: str) -> dict:
     periods = {p["role"]: p for p in x["periods"]}
     if "current" not in periods:
         raise ValueError("no current-quarter column found")
+    sourced = {}  # metric -> "derived" | "screener", for the current quarter
 
-    def metrics(p: dict | None) -> dict:
+    def metrics(p: dict | None, role: str) -> dict:
         if p is None:
             return {}
         v = {key: (p.get(key) * k if p.get(key) is not None else None) for key in p if key not in ("role", "period_end")}
         if v.get("revenue") is None and v.get("total_income") is not None:
             v["revenue"] = v["total_income"] - (v.get("other_income") or 0)
+        if v.get("pat") is None and v.get("pbt") is not None and v.get("tax_expense") is not None:
+            v["pat"] = v["pbt"] - v["tax_expense"]
+            if role == "current":
+                sourced["PAT"] = "derived"
+        pbt = v.get("pbt")
+        if pbt is None and v.get("pat") is not None and v.get("tax_expense") is not None:
+            pbt = v["pat"] + v["tax_expense"]
+            if role == "current":
+                sourced["PBT"] = "derived"
+        if pbt is None and v.get("pbt_before_exceptional") is not None and v.get("exceptional_items") is not None:
+            pbt = v["pbt_before_exceptional"] + v["exceptional_items"]
+            if role == "current":
+                sourced["PBT"] = "derived"
         if x["is_bank"]:
             nii = (v["interest_earned"] - v["interest_expended"]
                    if v.get("interest_earned") is not None and v.get("interest_expended") is not None else None)
-            return {"NII": nii, "Operating profit": v.get("operating_profit"), "PBT": v.get("pbt"), "PAT": v.get("pat"),
-                    "_base": v.get("interest_earned")}
-        ebitda = v.get("ebitda_reported")
-        if ebitda is None:
-            pbt0 = v.get("pbt_before_exceptional", v.get("pbt"))
-            if pbt0 is None:
-                pbt0 = v.get("pbt")
-            parts = [pbt0, v.get("finance_costs"), v.get("depreciation")]
-            if None not in parts:
-                ebitda = parts[0] + parts[1] + parts[2] - (v.get("other_income") or 0)
-        return {"Revenue": v.get("revenue"), "EBITDA": ebitda, "PBT": v.get("pbt"), "PAT": v.get("pat"),
-                "_base": v.get("revenue")}
+            out = {"NII": nii, "Operating profit": v.get("operating_profit"), "PBT": pbt, "PAT": v.get("pat"),
+                   "_base": v.get("interest_earned")}
+        else:
+            ebitda = v.get("ebitda_reported")
+            if ebitda is None:
+                pbt0 = v.get("pbt_before_exceptional")
+                if pbt0 is None:
+                    pbt0 = pbt
+                parts = [pbt0, v.get("finance_costs"), v.get("depreciation")]
+                if None not in parts:
+                    ebitda = parts[0] + parts[1] + parts[2] - (v.get("other_income") or 0)
+            out = {"Revenue": v.get("revenue"), "EBITDA": ebitda, "PBT": pbt, "PAT": v.get("pat"),
+                   "_base": v.get("revenue")}
+        for metric, value in ((x.get("_fill") or {}).get(role) or {}).items():
+            if out.get(metric) is None and value is not None:
+                out[metric] = value
+                if role == "current":
+                    sourced[metric] = "screener"
+        return out
 
-    now = metrics(periods["current"])
-    prev = metrics(periods.get("previous_quarter"))
-    ago = metrics(periods.get("year_ago_quarter"))
+    now = metrics(periods["current"], "current")
+    prev = metrics(periods.get("previous_quarter"), "previous_quarter")
+    ago = metrics(periods.get("year_ago_quarter"), "year_ago_quarter")
 
     rows = [
         {"metric": m, "value": round(now[m], 1) if now[m] is not None else None,
@@ -283,9 +343,11 @@ def results_card(x: dict, url: str) -> dict:
     top, bottom = ("NII", "PAT") if x["is_bank"] else ("Revenue", "PAT")
     if not x["is_bank"] and (now["Revenue"] or 0) <= 0:
         raise ValueError("revenue missing or non-positive")
-    if now.get(bottom) is None or not prev and not ago:
-        raise ValueError("incomplete table: need PAT and at least one comparison column")
-    if now.get("PBT") is None:
+    if now.get(bottom) is None:
+        raise ValueError(f"incomplete table: no {bottom} for the current quarter")
+    if not prev and not ago:
+        raise ValueError(f"incomplete table: no comparison column (read {', '.join(sorted(periods))})")
+    if need_pbt and now.get("PBT") is None:
         raise ValueError("incomplete table: PBT missing")
     if all(r["qoq"] is None and r["yoy"] is None for r in rows if r["metric"] == top):
         raise ValueError("incomplete table: no comparison for the top line")
@@ -298,12 +360,33 @@ def results_card(x: dict, url: str) -> dict:
         "basis": x["basis"],
         "unit": "₹ cr",
         "bank": x["is_bank"],
-        "ebitda_derived": not x["is_bank"] and periods["current"].get("ebitda_reported") is None,
+        "ebitda_derived": not x["is_bank"] and periods["current"].get("ebitda_reported") is None
+                          and sourced.get("EBITDA") != "screener",
+        "sourced": sourced,
         "rows": rows,
         "margins": margins,
         "source": {"url": url, "page": x.get("page")},
         "checks": checks,
     }
+
+
+def screener_fill(x: dict, card: dict, symbol: str) -> dict:
+    """Screener's PBT and operating profit (sales less expenses, i.e. EBITDA as
+    derived here) for each column, keyed by role. Only called after the reading's
+    revenue and PAT have matched screener, so both describe the same table."""
+    from pipeline import screener
+
+    table = screener.quarters(symbol, card["basis"])
+    fill = {}
+    for p in x["periods"]:
+        q = table.get(p.get("period_end") or "")
+        if not q:
+            continue
+        values = {"PBT": q.get("pbt")}
+        if not card["bank"]:
+            values["EBITDA"] = q.get("op_profit")
+        fill[p["role"]] = {m: v for m, v in values.items() if v is not None}
+    return fill
 
 
 # ---------------------------------------------------------------- leadership
@@ -441,7 +524,9 @@ def generic_card(category: str, pdf: bytes | None, text: str, symbol: str, url: 
 # ---------------------------------------------------------------- driver
 
 class CheckFailed(ValueError):
-    pass
+    def __init__(self, message: str, card: dict | None = None):
+        super().__init__(message)
+        self.card = card
 
 
 def _compare(card: dict, ref: dict | None) -> str | None:
@@ -458,6 +543,23 @@ def _compare(card: dict, ref: dict | None) -> str | None:
         if abs(ours - theirs) > max(1.0, CHECK_TOLERANCE * abs(theirs)):
             return f"{name} read as {ours:,.0f} but screener has {theirs:,.0f}"
     return None
+
+
+def _without_other_income(x: dict) -> bool:
+    """Revenue that equals total income has other income in it. Take it out of
+    every column where that is the case; False if the current column isn't."""
+    changed = False
+    for p in x["periods"]:
+        rev, total, other = p.get("revenue"), p.get("total_income"), p.get("other_income")
+        if rev is None or not other or (total is not None and abs(rev - total) > 0.005 * abs(total)):
+            continue
+        p["revenue"] = rev - other
+        changed = changed or p["role"] == "current"
+    return changed
+
+
+def _has_pbt(card: dict) -> bool:
+    return any(r["metric"] == "PBT" and r["value"] is not None for r in card["rows"])
 
 
 def cross_check(card: dict, symbol: str, period_end: str) -> dict:
@@ -485,16 +587,77 @@ def cross_check(card: dict, symbol: str, period_end: str) -> dict:
     raise CheckFailed(problem)
 
 
+_NOT_THE_TABLE = ("presentation", "press release", "media release", "transcript", "audio",
+                  "recording", "conference call", "earnings call", "newspaper", "investor meet")
+
+
+def results_candidates(story: dict) -> list[str]:
+    """Every PDF the company filed around this story, most likely table first.
+
+    A results event is several filings, and the one stories.py leads with is
+    sometimes the press release or the deck, which carry headline numbers but
+    not the statement. The statement can also arrive under a subject that was
+    grouped elsewhere (Eternal's did), so this looks at the company's filings
+    in the story's date range, not only the story's own."""
+    from datetime import datetime, timedelta
+
+    first = datetime.fromisoformat(story["first_at"]) - timedelta(days=2)
+    last = datetime.fromisoformat(story.get("last_at") or story["first_at"]) + timedelta(days=2)
+    rows = (db.client().table("filings").select("subject,detail,attachment_url,story_id")
+            .eq("symbol", story["symbol"]).gte("filed_at", first.isoformat())
+            .lte("filed_at", last.isoformat()).execute().data)
+
+    def rank(f):
+        text = f"{f['subject']} {f.get('detail') or ''} {f['attachment_url']}".lower()
+        return (("result" in text and not any(w in text for w in _NOT_THE_TABLE)) * 4
+                + (f.get("story_id") == story["id"]) * 2
+                + ("outcome" in text) - any(w in text for w in _NOT_THE_TABLE) * 4)
+
+    urls = [f["attachment_url"] for f in sorted(rows, key=rank, reverse=True)
+            if (f.get("attachment_url") or "").lower().endswith(".pdf")]
+    if story.get("lead_url"):
+        urls.append(story["lead_url"])
+    return list(dict.fromkeys(urls))
+
+
+def pick_results_pdf(story: dict, enough: int = 7, tries: int = 6) -> tuple[str, bytes]:
+    """The candidate whose best page looks most like a results statement.
+    Stops at the first one that clearly is; no model call."""
+    best = None
+    for url in results_candidates(story)[:tries]:
+        try:
+            content = download(url)
+        except Exception:
+            continue
+        strength = statement_strength(content)
+        if best is None or strength > best[0]:
+            best = (strength, url, content)
+        if strength >= enough:
+            break
+    if best is None:
+        raise ValueError("no results PDF could be downloaded")
+    return best[1], best[2]
+
+
 def build(story: dict, company: str) -> dict:
     cat, url = story["category"], story.get("lead_url")
     if cat == "results":
         if not url:
             raise ValueError("results story without a PDF")
+        content = None
+        known = llm.lookup([url, PROMPT_VERSION, "results"])
+        try:
+            if known is None:
+                raise ValueError
+            results_card(copy.deepcopy(known), url)  # the lead's stored reading still passes: keep it
+        except ValueError:
+            url, content = pick_results_pdf(story)
+
         def extract():
             """Full Flash models first, then Lite. Every reading must agree with
             screener before it is kept; a failed reading is never cached, so a
             better model can try again later."""
-            pdf, pages = results_pages(download(url))
+            pdf, pages = results_pages(content if content is not None else download(url))
             problems = []
             disputed = []  # (model, x, card, why): complete readings screener disagrees with
 
@@ -513,6 +676,53 @@ def build(story: dict, company: str) -> dict:
                             x1["_model"] = m1
                             return x1
                 return None
+            def finish(x, model):
+                """Completeness, then screener's cross-check on revenue and PAT. Only a
+                reading that passes both may borrow screener's PBT and EBITDA for lines
+                it couldn't find; it still has to end up with a PBT.
+
+                Two reader slips are repaired from the filing's own lines, and the
+                repaired reading still has to match screener on both revenue and PAT:
+                a unit the reader didn't name (each scale is tried), and total income
+                taken for revenue (other income is taken back out)."""
+                stated = _normalise(x)["unit"]
+                # The stated unit first; readers also misread "₹ in million" as crore,
+                # so the other scales are tried when it fails. Both revenue and PAT
+                # have to match at the same scale, which a wrong scale won't do.
+                units = [stated] * (stated in _TO_CRORE) + [u for u in _TO_CRORE if u != stated]
+                current = next((p for p in x["periods"] if p["role"] == "current"), None)
+                if current is None:
+                    raise ValueError("no current-quarter column found")
+                failure = None
+                for unit in units:
+                    for repair in (False, True):
+                        y = copy.deepcopy(x)
+                        y["unit"] = unit
+                        if repair and not _without_other_income(y):
+                            continue
+                        card = results_card(y, url, need_pbt=False)
+                        try:
+                            y["_check"] = cross_check(card, story["symbol"], current["period_end"])
+                        except CheckFailed as e:
+                            failure = failure or CheckFailed(str(e), card)
+                            continue
+                        y["basis"] = card["basis"]
+                        notes = []
+                        if unit != stated:
+                            notes.append(f"unit not stated by the reader; {unit} is the scale that matches"
+                                         if stated not in _TO_CRORE else
+                                         f"the reader took the table to be in {stated}; {unit} is the scale that matches")
+                        if repair:
+                            notes.append("the reader took total income for revenue, so other income was taken out")
+                        if notes:
+                            y["_note"] = "; ".join(notes)
+                        if not _has_pbt(card) or any(r["value"] is None for r in card["rows"]):
+                            y["_fill"] = screener_fill(y, card, story["symbol"])
+                        results_card(y, url)  # raises if PBT is still missing
+                        y["_model"] = model
+                        return y
+                raise failure
+
             for model in RESULTS_MODELS + llm.GEMINI_FALLBACKS:
                 try:
                     x = llm.gemini_json(RESULTS_PROMPT, purpose="results", model=model, fallback=False,
@@ -523,15 +733,11 @@ def build(story: dict, company: str) -> dict:
                 if x.get("page") and 1 <= x["page"] <= len(pages):
                     x["page"] = pages[x["page"] - 1]
                 try:
-                    card = results_card(x, url)
-                    current = next(p for p in x["periods"] if p["role"] == "current")
-                    x["_check"] = cross_check(card, story["symbol"], current["period_end"])
-                    x["basis"] = card["basis"]
-                    x["_model"] = model
-                    return x
+                    return finish(x, model)
                 except CheckFailed as e:
                     problems.append(f"{model}: {e}")
-                    disputed.append((model, x, card, str(e)))
+                    if e.card and _has_pbt(e.card):
+                        disputed.append((model, x, e.card, str(e)))
                     if (hit := agreed()) is not None:
                         return hit
                 except (ValueError, KeyError, StopIteration) as e:  # incomplete or malformed table
@@ -545,15 +751,11 @@ def build(story: dict, company: str) -> dict:
                     x = llm.groq_json(RESULTS_PROMPT + RESULTS_TEXT_SUFFIX + text, purpose="results",
                                       model=llm.GROQ_LARGE)
                     x["page"] = pages[0] if pages else None
-                    card = results_card(x, url)
-                    current = next(p for p in x["periods"] if p["role"] == "current")
-                    x["_check"] = cross_check(card, story["symbol"], current["period_end"])
-                    x["basis"] = card["basis"]
-                    x["_model"] = llm.GROQ_LARGE
-                    return x
+                    return finish(x, llm.GROQ_LARGE)
                 except CheckFailed as e:
                     problems.append(f"{llm.GROQ_LARGE}: {e}")
-                    disputed.append((llm.GROQ_LARGE, x, card, str(e)))
+                    if e.card and _has_pbt(e.card):
+                        disputed.append((llm.GROQ_LARGE, x, e.card, str(e)))
                     if (hit := agreed()) is not None:
                         return hit
                 except (ValueError, KeyError, StopIteration, TypeError) as e:
@@ -575,6 +777,8 @@ def build(story: dict, company: str) -> dict:
             card = results_card(x, url)
         if (x.get("_check") or {}).get("relabelled"):
             card["basis"] = x["_check"]["relabelled"].split(" → ")[1]
+        if x.get("_note"):
+            card["checks"].append(x["_note"][0].upper() + x["_note"][1:] + ".")
         card["model"] = x.get("_model")
         card["check"] = x.get("_check")
         if card["check"] and card["check"].get("disputed"):
@@ -635,7 +839,29 @@ if __name__ == "__main__":
     ap.add_argument("--retry-failed", action="store_true")
     ap.add_argument("--redo-results", action="store_true", help="rebuild every results card")
     ap.add_argument("--show", metavar="STORY_ID", help="print the stored extraction for one story")
+    ap.add_argument("--debug", metavar="SYMBOL", help="show what a reader sees and returns for a results story")
     args = ap.parse_args()
+    if args.debug:
+        import json
+        import re
+
+        story = (db.client().table("stories").select("*").eq("symbol", args.debug).eq("category", "results")
+                 .order("first_at", desc=True).limit(1).execute().data[0])
+        print("lead:", story["lead_url"], "|", story.get("headline", "")[:80])
+        url, content = pick_results_pdf(story)
+        print("chosen:", url, "| statement strength", statement_strength(content))
+        pdf, pages = results_pages(content)
+        print("pages sent:", pages)
+        lines = [ln.strip() for ln in _pages_text(pdf, limit=60000).splitlines()]
+        wanted = re.compile(r"revenue|total income|other income|before tax|tax expense|profit for|net profit|"
+                            r"profit after|quarter ended|three months|crore|lakh|million", re.I)
+        for ln in [ln for ln in lines if wanted.search(ln)][:30]:
+            print("  |", re.sub(r"\s{2,}", "  ", ln)[:170])
+        x = llm.gemini_json(RESULTS_PROMPT, purpose="results", model=llm.GEMINI_LITE, pdf=pdf, schema=RESULTS_SCHEMA)
+        print("reader:", json.dumps({k: v for k, v in x.items() if k != "periods"}))
+        for per in x.get("periods", []):
+            print(" ", json.dumps({k: v for k, v in per.items() if v is not None}))
+        raise SystemExit
     if args.show:
         import hashlib
         import json

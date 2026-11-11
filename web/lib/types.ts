@@ -13,6 +13,7 @@ export type ResultsCard = {
   unit: string;
   bank: boolean;
   ebitda_derived: boolean;
+  sourced?: Record<string, "derived" | "screener">;
   rows: ResultsRow[];
   margins: Record<string, { now: number; qoq_bps: number | null; yoy_bps: number | null }>;
   source: { url: string; page?: number | null };

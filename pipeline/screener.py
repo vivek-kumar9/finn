@@ -133,13 +133,14 @@ def parse(html: str) -> dict:
         op = _pick(q["rows"], "Operating Profit", "Financing Profit")
         pat = _pick(q["rows"], "Net Profit")
         dep = _pick(q["rows"], "Depreciation")
+        pbt = _pick(q["rows"], "Profit before tax")
         for i, col in enumerate(q["columns"]):
             end = _month_end(col)
             if end and sales:
                 quarters.append({
                     "end": end.isoformat(), "sales": sales[i],
                     "op_profit": op[i] if op else None, "pat": pat[i] if pat else None,
-                    "depreciation": dep[i] if dep else None,
+                    "depreciation": dep[i] if dep else None, "pbt": pbt[i] if pbt else None,
                 })
 
     annual = _table(soup, "profit-loss")

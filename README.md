@@ -50,7 +50,7 @@ Models read; code decides. Every number shown is computed in Python from a prima
 | --- | --- | --- |
 | Filing category | Rules first (92% of filings), Groq `gpt-oss-20b` for the rest | Most NSE subjects are formulaic; a label is an easy task |
 | Results table → 4 metrics × 3 periods | Gemini 3.5 Flash, other full Flash models, then Lite and Groq (on the page text) | Every reading must match screener's quarterly table; a weaker reader's work is kept only if it does |
-| Page finding for results | None: pypdf scores pages on line items | Large filings put the table on page 12+; only those pages are sent |
+| Finding the results table | None: pypdf scores the company's PDFs, then pages, on statement line items | A story's lead filing is often the press release or the deck; large filings put the table on page 12+. Only the table pages are sent |
 | Leadership, other filings, bios | Gemini Flash-Lite | Short, factual extraction |
 | Guidance from transcripts | Full Flash, Lite as fallback | Prose, and every quote is verified afterwards |
 | Promise verdicts, QoQ/YoY, margins, ratios | **Python** | Arithmetic doesn't belong in a prompt |
@@ -60,23 +60,25 @@ Cost controls: every model output is cached by document URL and prompt version, 
 
 ## In numbers
 
-From the live system on 10 November 2026 (`python scripts/stats.py`):
+From the live system on 11 November 2026 (`python scripts/stats.py`):
 
-- **256** NSE filings across the 18 holdings over 30 days. **235 (92%)** classified by rules; 21 needed a model.
-- **134** stories. 63 got a card; 69 routine items were collapsed without any model call.
-- **14 of 16** results stories have a grid that matches screener's quarterly table. The other two point to the filing: ETERNAL's results PDF was filed under a subject that landed in a different story, and no reader, full Gemini Flash included, could pull a complete table from PERSISTENT's PDF.
-- **27** earnings-call transcripts read across 7 companies. **64** guidance quotes kept; **3 (4%)** dropped because their words were not in the transcript.
-- **185** model calls and **806k** tokens to build all of the above, 44% of them spent reading transcripts. Cost: **₹0** on free tiers.
+- **259** NSE filings across the 18 holdings over 30 days. **238 (92%)** classified by rules; 21 needed a model.
+- **135** stories. 65 got a card; 69 routine items were collapsed without any model call.
+- **15 of 16** results stories have a grid that matches screener's quarterly table on revenue and PAT. The sixteenth, Eternal, points to the filing: none of its PDFs around the results date carried a statement table the readers could find.
+- **31** earnings-call transcripts read. **67** guidance quotes kept; **3 (4%)** dropped because their words were not in the transcript.
+- **288** model calls and **1.23M** tokens to build all of the above: 56% on results tables, most of it re-reading the hard ones while the checks were being tightened, and 32% on transcripts. Cost: **₹0** on free tiers.
 - A repeat research view: **0** model calls, about **5 seconds**.
 
-The cross-check earned its place. It caught a model reading CDSL's total income (₹417 cr) as revenue (₹394 cr), and Titan's standalone table labelled as consolidated, which is now relabelled rather than rejected.
+The cross-check earned its place. It caught readers taking CDSL's total income (₹417 cr) for revenue (₹394 cr), Persistent's table in ₹ million read as crore, and Titan's standalone table labelled as consolidated. Each is now repaired from the filing's own lines (other income taken back out, the scale corrected, the basis relabelled), and the repaired reading still has to match screener on both revenue and PAT. The card says which repair was made.
 
-The free tier shaped the build. Gemini's daily quota is roughly 20 requests per model, and on the build day every full Flash model was spent or overloaded by evening, so 18 of the 27 transcripts were read by Flash-Lite through the fallback chain. Results tables are held to a stricter rule: a Lite or Groq reading is kept only if it matches screener.
+The biggest fix wasn't a model. Four results cards kept failing with every reader, full Flash included, and a debug run showed why: the story led with the press release or the investor deck, which carry headline numbers but no statement. Cards now score every PDF the company filed around the results date on statement line items (other income, finance costs, tax expense, EPS) and read the best one. That took results from 11 to 15 of 16, with no extra model calls.
+
+The free tier shaped the build. Gemini's daily quota is roughly 20 requests per model, and on the build days every full Flash model was spent or overloaded by morning, so 18 of the 31 transcripts and most of the late results tables were read by Flash-Lite through the fallback chain. Results are held to a stricter rule: any reading, whichever model made it, is kept only if it matches screener.
 
 ## Judgment calls
 
 - **EBITDA is derived** (profit before exceptional items and tax + finance costs + depreciation − other income) because most results filings don't print it, and it is marked *d* on the card. Banks get net interest income and operating profit instead.
-- **A half-read table is rejected**, not shown: a results card needs PAT and at least one comparison column.
+- **A half-read table is rejected**, not shown: a results card needs revenue, PAT, PBT and at least one comparison column. PBT can be worked out from the filing (PAT + tax). When the filing's PBT or EBITDA line can't be read, the card may take screener's figure, but only after revenue and PAT have matched, and it marks that line *s*.
 - **Segment guidance is never judged against company totals.** An early version marked "smart metering revenue ₹700–800 cr" as met against total revenue; promises now carry a scope, and a test pins that case.
 - **Small penalties and rating reaffirmations are routine.** A ₹1 lakh telecom fine on an ₹8 lakh crore company is not news.
 - **The Brief anchors to the newest data**, with a "data as of" stamp, so it stays honest when ingest is paused or markets are closed.
@@ -94,6 +96,7 @@ cp .env.example .env                      # Supabase, Gemini, Groq, Telegram key
 python -m pipeline.ingest --days 30       # backfill
 python -m pipeline.cards --limit 60       # build cards
 python -m pipeline.research KAYNES        # one research report, printed section by section
+pip install -r requirements-dev.txt      # pytest, reportlab
 python -m pytest -q                       # tests, including two real screener pages
 cd web && npm install && npm run dev      # app on localhost:3000
 ```

@@ -1,7 +1,22 @@
 import type { LeadershipCard, ResultsCard, Story, SummaryCard } from "@/lib/types";
 import { bps, crore, pct, rupees, tone } from "@/lib/format";
 
+const MARK_TITLE: Record<string, string> = {
+  EBITDA: "Derived: PBT + finance costs + depreciation − other income",
+  PBT: "Derived: PAT + tax expense, from the filing's own lines",
+};
+
+function mark(card: ResultsCard, metric: string) {
+  const how = card.sourced?.[metric];
+  if (how === "screener") return <sup title="From screener's quarterly table: the filing's line wasn't read">s</sup>;
+  if (how === "derived" || (metric === "EBITDA" && card.ebitda_derived))
+    return <sup title={MARK_TITLE[metric]}>d</sup>;
+  return null;
+}
+
 export function ResultsGrid({ card }: { card: ResultsCard }) {
+  const borrowed = Object.values(card.sourced ?? {}).includes("screener");
+  const derived = card.ebitda_derived || Object.values(card.sourced ?? {}).includes("derived");
   const marginName = card.bank ? "Operating profit" : "EBITDA";
   const margin = card.margins[marginName];
   const page = card.source.page ? `#page=${card.source.page}` : "";
@@ -24,7 +39,7 @@ export function ResultsGrid({ card }: { card: ResultsCard }) {
             <tr key={r.metric}>
               <th scope="row">
                 {r.metric}
-                {r.metric === "EBITDA" && card.ebitda_derived && <sup title="Derived: PBT + finance costs + depreciation − other income">d</sup>}
+                {mark(card, r.metric)}
               </th>
               <td>{crore(r.value)}</td>
               <td className={tone(r.qoq)}>{pct(r.qoq)}</td>
@@ -45,7 +60,8 @@ export function ResultsGrid({ card }: { card: ResultsCard }) {
         <a href={card.source.url + page} target="_blank" rel="noreferrer">
           Results filing{card.source.page ? `, page ${card.source.page}` : ""}
         </a>
-        {card.ebitda_derived && <span> d: EBITDA derived from the filing&rsquo;s lines</span>}
+        {derived && <span> d: derived from the filing&rsquo;s lines</span>}
+        {borrowed && <span> s: from screener, after revenue and PAT matched</span>}
       </p>
       {card.check && (
         <p className="source">{card.check.metrics.join(" and ")} match screener&rsquo;s quarterly table.</p>
