@@ -173,6 +173,16 @@ def lookup(key_parts: list[str]):
     return hit[0]["value"] if hit else None
 
 
+def store(key_parts: list[str], value):
+    """Overwrite a stored output, e.g. with a check added after it was made."""
+    import hashlib
+
+    from pipeline import db
+
+    key = hashlib.sha256("|".join(key_parts).encode()).hexdigest()
+    db.upsert("research_cache", [{"key": key, "value": value}], on_conflict="key")
+
+
 def forget(key_parts: list[str]):
     """Drop a stored output, e.g. one that no longer passes stricter checks."""
     import hashlib

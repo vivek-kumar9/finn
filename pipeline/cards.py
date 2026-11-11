@@ -175,7 +175,8 @@ Copy numbers exactly as printed, in the table's own unit; losses are negative.
   before tax"; a table may print it as "profit before share of associates and tax"
   followed by the share, in which case use the line after the share is added.
 - tax_expense: total tax expense (current + deferred + earlier years); a credit is negative
-- pat: profit for the period (before other comprehensive income)
+- pat: profit for the period (before other comprehensive income), the total
+  before it is split between owners and non-controlling interests
 - ebitda_reported: only if the table prints EBITDA
 - For banks set is_bank and fill interest_earned, interest_expended and operating_profit
   (operating profit before provisions and contingencies).
@@ -770,11 +771,25 @@ def build(story: dict, company: str) -> dict:
         x = llm.cached(key, extract)
         try:
             card = results_card(x, url)
+            if "_check" not in x:  # stored before the cross-check existed: check it now
+                current = next(p for p in x["periods"] if p["role"] == "current")
+                x["_check"] = cross_check(card, story["symbol"], current["period_end"])
+                x["basis"] = card["basis"]
+                llm.store(key, x)
         except ValueError:
-            # Read before the current checks existed and fails them now: read again.
+            # A stored reading that fails today's checks is read again, from the
+            # PDF that looks most like a results statement.
             llm.forget(key)
+            url, content = pick_results_pdf(story)
+            key = [url, PROMPT_VERSION, "results"]
             x = llm.cached(key, extract)
             card = results_card(x, url)
+        if (x["_check"].get("metrics") and "_fill" not in x
+                and any(r["value"] is None for r in card["rows"])):
+            # Passed on revenue and PAT but a line wasn't read: screener's figure, marked.
+            x["_fill"] = screener_fill(x, card, story["symbol"])
+            card = results_card(x, url)
+            llm.store(key, x)
         if (x.get("_check") or {}).get("relabelled"):
             card["basis"] = x["_check"]["relabelled"].split(" → ")[1]
         if x.get("_note"):
@@ -785,12 +800,6 @@ def build(story: dict, company: str) -> dict:
             card["checks"].append(f"Two independent readings of the filing agree, but screener differs: "
                                   f"{card['check']['disputed']}.")
             card["check"] = None
-        if "_check" not in x:  # read before cross-checking existed: check it now, no model call
-            current = next(p for p in x["periods"] if p["role"] == "current")
-            try:
-                card["check"] = cross_check(card, story["symbol"], current["period_end"])
-            except ValueError as e:
-                card["checks"].append(f"Not confirmed against screener: {e}.")
         return card
     if cat == "management_change":
         if not url:

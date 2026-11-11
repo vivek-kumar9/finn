@@ -6,7 +6,12 @@ const MARK_TITLE: Record<string, string> = {
   PBT: "Derived: PAT + tax expense, from the filing's own lines",
 };
 
+function hasValue(card: ResultsCard, metric: string) {
+  return card.rows.some((r) => r.metric === metric && r.value !== null);
+}
+
 function mark(card: ResultsCard, metric: string) {
+  if (!hasValue(card, metric)) return null;
   const how = card.sourced?.[metric];
   if (how === "screener") return <sup title="From screener's quarterly table: the filing's line wasn't read">s</sup>;
   if (how === "derived" || (metric === "EBITDA" && card.ebitda_derived))
@@ -15,8 +20,9 @@ function mark(card: ResultsCard, metric: string) {
 }
 
 export function ResultsGrid({ card }: { card: ResultsCard }) {
-  const borrowed = Object.values(card.sourced ?? {}).includes("screener");
-  const derived = card.ebitda_derived || Object.values(card.sourced ?? {}).includes("derived");
+  const sourced = Object.entries(card.sourced ?? {}).filter(([m]) => hasValue(card, m));
+  const borrowed = sourced.some(([, how]) => how === "screener");
+  const derived = (card.ebitda_derived && hasValue(card, "EBITDA")) || sourced.some(([, how]) => how === "derived");
   const marginName = card.bank ? "Operating profit" : "EBITDA";
   const margin = card.margins[marginName];
   const page = card.source.page ? `#page=${card.source.page}` : "";

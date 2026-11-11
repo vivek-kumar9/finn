@@ -226,3 +226,30 @@ def test_misstated_unit_is_corrected_only_when_both_lines_match(monkeypatch):
     wrong_pat = {k: dict(v, pat=v["pat"] * 2) for k, v in SCREENER_1200.items()}
     with pytest.raises(ValueError, match="Revenue read as 120,000"):
         _build_with(monkeypatch, extraction(unit="crore"), wrong_pat)
+
+
+def test_stored_reading_gets_checked_filled_or_read_again(monkeypatch):
+    from pipeline import cards, llm
+
+    old = extraction()  # stored before checks existed: no _check, no EBITDA inputs
+    for p in old["periods"]:
+        p["finance_costs"] = None
+    table = {k: dict(v, op_profit=v["pbt"] + 20) for k, v in SCREENER_1200.items()}
+    stored = {}
+    reads = []
+    _build_with(monkeypatch, old, table)  # installs the stubs
+    monkeypatch.setattr(llm, "cached", lambda key, fn, stats=None: stored.get("x") or fn())
+    monkeypatch.setattr(llm, "store", lambda key, value: stored.update(x=value))
+    monkeypatch.setattr(llm, "forget", lambda key: stored.clear())
+    monkeypatch.setattr(llm, "gemini_json", lambda *a, **k: reads.append(1) or __import__("copy").deepcopy(old))
+
+    stored["x"] = __import__("copy").deepcopy(old)
+    card = cards.build({"category": "results", "lead_url": "u", "symbol": "X", "id": "X:results:1"}, "X Ltd")
+    rows = {r["metric"]: r["value"] for r in card["rows"]}
+    assert rows["EBITDA"] == 220.0 and card["sourced"] == {"EBITDA": "screener"} and not reads
+    assert stored["x"]["_check"]["metrics"] == ["Revenue", "PAT"]
+
+    stored["x"] = dict(__import__("copy").deepcopy(old), periods=[dict(p, pat=p["pat"] * 0.8) for p in old["periods"]])
+    stored["x"].pop("_check", None)
+    card = cards.build({"category": "results", "lead_url": "u", "symbol": "X", "id": "X:results:1"}, "X Ltd")
+    assert reads and {r["metric"]: r["value"] for r in card["rows"]}["PAT"] == 150.0
