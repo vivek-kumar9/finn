@@ -2,8 +2,9 @@ name: ingest
 
 on:
   schedule:
-    # Hourly 09:00-19:00 IST on weekdays (cron runs in UTC). The 19:00 run
-    # picks up post-market results and the final EOD prices.
+    # Backup only. The hourly run comes from Supabase (db/schedule.sql), because
+    # GitHub fired this schedule about twice a day at random times. Same slots:
+    # 09:00-19:00 IST on weekdays (cron is in UTC).
     - cron: "30 3-13 * * 1-5"
   workflow_dispatch:
     inputs:

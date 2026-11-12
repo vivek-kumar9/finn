@@ -33,7 +33,7 @@ Research only uses primary sources: transcripts, annual reports and standard fin
 
 ## How it's put together
 
-- **Ingest** (Python, runs on Render). Every hour on market days, GitHub Actions calls the API. The API pulls end-of-day prices from Yahoo and new filings from NSE, sorts the filings into categories and stories, builds the cards and sends the Telegram alerts. Everything goes into Supabase (Postgres).
+- **Ingest** (Python, runs on Render). Every hour on market days, Supabase's built-in scheduler (pg_cron, set up by `db/schedule.sql`) calls the API, with a GitHub Actions workflow as a backup. The API pulls end-of-day prices from Yahoo and new filings from NSE, sorts the filings into categories and stories, builds the cards and sends the Telegram alerts. Everything goes into Supabase (Postgres).
 - **App** (Next.js, installable as a PWA, on Vercel). The Brief reads Supabase straight from the browser with a read-only key (row-level security), so the first screen never waits for the free server to wake up.
 - **API** (FastAPI on Render). Only the slow work: research, streamed section by section, the Telegram webhook and the hourly ingest trigger. It starts up before importing the pipeline, so cold starts stay short, and it skips an ingest if the previous one is still running.
 
@@ -57,13 +57,13 @@ To keep the cost at ₹0, every model output is cached by document URL and promp
 
 ## Numbers
 
-From the live system on 11 November 2026 (`python scripts/stats.py`):
+From the live system on 13 November 2026 (`python scripts/stats.py`):
 
-- 259 NSE filings across the 18 holdings over 30 days. 238 (92%) were classified by rules and 21 needed a model.
-- 135 stories. 65 got a card, and 69 routine ones were folded away without any model call.
-- 15 of 16 results cards match screener's quarterly table on revenue and PAT. Eternal's links to the filing instead, because none of its PDFs around the results date had a statement table the models could read.
+- 282 NSE filings across the 18 holdings (a 30-day backfill on 9 November, plus everything since). 259 (92%) were classified by rules and 23 needed a model.
+- 147 stories. 71 got a card, and 75 routine ones were folded away without any model call.
+- 17 of 18 results cards match screener's quarterly table on revenue and PAT. Eternal's links to the filing instead, because none of its PDFs around the results date had a statement table the models could read.
 - 31 earnings-call transcripts read. 67 guidance quotes kept and 3 (4%) dropped because the words weren't in the transcript.
-- 288 model calls and 1.23M tokens for all of this: 56% on results tables (mostly re-reading the hard ones while I was tightening the checks) and 32% on transcripts. Cost: ₹0 on free tiers.
+- 305 model calls and 1.28M tokens for all of this: 58% on results tables (mostly re-reading the hard ones while I was tightening the checks) and 31% on transcripts. Cost: ₹0 on free tiers.
 - Opening research that has already been run: 0 model calls, about 5 seconds.
 
 ## What went wrong, and what I changed
@@ -71,6 +71,7 @@ From the live system on 11 November 2026 (`python scripts/stats.py`):
 - **The screener check caught real mistakes.** A model read CDSL's total income (₹417 cr) as revenue (₹394 cr), another read Persistent's table in ₹ million as crore, and Titan's standalone table came back labelled as consolidated. Each of these is now fixed from the filing's own lines (other income taken out, the unit corrected, the label switched), and the fixed reading still has to match screener on both revenue and PAT. The card says what was fixed.
 - **Four results cards kept failing with every model, full Flash included.** A debug run showed the models weren't the problem: the story was handing them the press release or the investor deck instead of the results statement. Now the code scores every PDF the company filed around the results date on statement line items and reads the best one. That took results from 11 to 15 of 16 with no extra model calls.
 - **Segment guidance was being judged against company totals.** My first version marked Kaynes' smart-metering guidance as "met" against the whole company's revenue. Promises now have a scope, segment ones are never checked against company totals, and a test covers that case.
+- **The hourly run wasn't hourly.** The ingest was scheduled with GitHub Actions, but its run log showed GitHub firing it about twice a day, at random times (17:13, 00:20, even 04:08 IST). GitHub drops scheduled runs for small repos when it's busy. The hourly run and the keep-alive now come from Supabase's own scheduler, and GitHub is just a backup. The API skips a run if the previous one is still going, so the two never double up.
 - **"Stock up X% that day" was quoting the wrong day.** The line on a card used to take the stock's biggest move anywhere in the window, so a results card could quote a move from before the results came out. Now it only uses the move that the story explains.
 - **The free tier shaped a lot of this.** Gemini gives roughly 20 requests per model per day, and on the build days every full Flash model was used up or overloaded by the morning. So 18 of the 31 transcripts were read by Flash-Lite through the fallback chain.
 
@@ -96,7 +97,8 @@ From the live system on 11 November 2026 (`python scripts/stats.py`):
 ```bash
 python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
 cp .env.example .env                      # Supabase, Gemini, Groq, Telegram and Tavily keys
-# run db/schema.sql once in the Supabase SQL editor
+# run db/schema.sql once in the Supabase SQL editor, then db/schedule.sql
+# (with your PROBE_TOKEN filled in) for the hourly run
 python -m pipeline.ingest --days 30       # backfill
 python -m pipeline.cards --limit 60       # build cards
 python -m pipeline.research KAYNES        # one research run, printed section by section
