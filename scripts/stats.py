@@ -1,9 +1,11 @@
-"""Numbers for the README, straight from the database.
+"""Numbers for the README, straight from the database, plus a quick check that
+the hourly ingest is still running.
 
     python scripts/stats.py
 """
 import sys
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -60,3 +62,16 @@ for u in usage:
 print(f"model calls: {len(usage)}, tokens: {sum(tok.values()):,}")
 for k, n in calls.most_common():
     print(f"  {k}: {n} calls, {tok[k]:,} tokens")
+
+print("\nlast ingest runs:")
+for r in db.client().table("ingest_runs").select("*").order("started_at", desc=True).limit(5).execute().data:
+    took = ""
+    if r["finished_at"]:
+        secs = (datetime.fromisoformat(r["finished_at"]) - datetime.fromisoformat(r["started_at"])).total_seconds()
+        took = f" in {secs / 60:.1f} min"
+    state = "ok" if r["ok"] else "FAILED" if r["ok"] is False else "still running?"
+    print(f"  {r['started_at'][:16]} {state}{took}: {(r['note'] or '')[:110]}")
+latest = db.client().table("signals").select("date").order("date", desc=True).limit(1).execute().data
+print(f"latest prices: {latest[0]['date'] if latest else 'none'}")
+waiting = Counter(s["category"] for s in stories if s["card_status"] in ("pending", "failed"))
+print(f"cards pending or failed: {dict(waiting) or 'none'}")

@@ -1,15 +1,17 @@
-"""Turn a story's lead filing into the card the Brief shows.
+"""Build the card the Brief shows for each story.
 
-Models only read the PDF and return what is printed in it. Everything the
-investor compares (QoQ, YoY, margins, yields) is computed here.
+Models only read PDFs and copy out what's printed. Anything you'd compare
+(QoQ, YoY, margins, yields) is worked out here in Python.
 
     python -m pipeline.cards --limit 50
+    python -m pipeline.cards --debug CDSL      # what the results reader sees
 """
 import argparse
 import copy
 import io
 import os
-from datetime import date
+import time
+from datetime import date, datetime, timedelta
 
 import requests
 from pypdf import PdfReader, PdfWriter
@@ -18,9 +20,9 @@ from pipeline import db, llm
 from pipeline.nse import UA
 from pipeline.stories import WEIGHT
 
-# Bump to re-read everything. Not bumped for the tax and exceptional-items
-# fields: readings that already pass need neither, and failed readings are never
-# cached, so only the failures are read again with the new prompt.
+# Bumping this re-reads everything. I didn't bump it when the tax and
+# exceptional-items fields were added: readings that already pass don't need
+# them, and failed readings are never stored, so only those get read again.
 PROMPT_VERSION = "cards-v4"
 MIN_WEIGHT = 4  # below this a story stays a one-line routine item
 
@@ -55,7 +57,7 @@ def _subset(content: bytes, pages: list[int]) -> bytes:
 
 
 def fetch_pdf(url: str, max_pages: int) -> bytes:
-    """The first pages only: appointment details and announcements are up front."""
+    """Just the first pages. Appointment details and announcements are at the front."""
     content = download(url)
     try:
         n = len(PdfReader(io.BytesIO(content)).pages)
@@ -95,12 +97,12 @@ def statement_strength(content: bytes) -> int:
 
 
 def results_pages(content: bytes, max_pages: int = 4) -> tuple[bytes, list[int]]:
-    """Find the results table instead of trusting it to be on page 1.
+    """Find the pages with the results table; it isn't always on page 1.
 
-    Big filings open with a cover letter, the auditor's review report and
-    sometimes a press release, so the table can be on page 12. Pages are
-    scored on the line items a results table must carry; consolidated wins
-    ties. Scanned PDFs have no text layer, so they fall back to the first pages.
+    Big filings start with a cover letter, the auditor's report and sometimes a
+    press release, so the table can be on page 12. Pages are scored on line items
+    every results table has, and consolidated wins a tie. Scanned PDFs have no
+    text to score, so they just send the first pages.
     """
     reader = PdfReader(io.BytesIO(content))
     scores = []
@@ -112,8 +114,8 @@ def results_pages(content: bytes, max_pages: int = 4) -> tuple[bytes, list[int]]
         first = list(range(min(len(reader.pages), 8)))
         return _subset(content, first), [i + 1 for i in first]
     best = max(scores)[1]
-    # Keep the best page, the page after it (tables spill over) and any
-    # other qualifying pages, up to the cap, in document order.
+    # The best page, the one after it (tables run over) and any other pages that
+    # scored, up to the cap, in their original order.
     picked = {best, best + 1} & set(range(len(reader.pages)))
     for _, i in sorted(scores, reverse=True):
         if len(picked) >= max_pages:
@@ -259,11 +261,12 @@ def _normalise(x: dict) -> dict:
 
 
 def results_card(x: dict, url: str, need_pbt: bool = True) -> dict:
-    """Pure arithmetic over the extracted table. Raises if the extraction is unusable.
+    """Turn a reading into the card: units, derived lines, QoQ, YoY, margins.
+    Raises ValueError if the reading isn't good enough to show.
 
-    x["_fill"], when present, holds screener's figures for lines the reader
-    couldn't find; they are used only where the filing's own value is missing,
-    and the card says which ones they are."""
+    x["_fill"], if there, has screener's figures for lines the reader couldn't
+    find. They're only used where the filing's own number is missing, and the
+    card marks which lines they are."""
     x = _normalise(x)
     if x["unit"] not in _TO_CRORE:
         raise ValueError(f"unknown unit {x['unit']!r}")
@@ -372,9 +375,9 @@ def results_card(x: dict, url: str, need_pbt: bool = True) -> dict:
 
 
 def screener_fill(x: dict, card: dict, symbol: str) -> dict:
-    """Screener's PBT and operating profit (sales less expenses, i.e. EBITDA as
-    derived here) for each column, keyed by role. Only called after the reading's
-    revenue and PAT have matched screener, so both describe the same table."""
+    """Screener's PBT and operating profit (sales minus expenses, the same thing
+    as EBITDA here) for each column, keyed by role. Only used once the reading's
+    revenue and PAT have matched screener, so both are the same table."""
     from pipeline import screener
 
     table = screener.quarters(symbol, card["basis"])
@@ -433,22 +436,35 @@ Snippets:
 
 
 def _web_bio(name: str, role: str, company: str) -> dict | None:
+    """A short background from a web search, for people the filing doesn't profile.
+    Stored, so rebuilding a card doesn't search again. A failed search just means no bio."""
     key = os.environ.get("TAVILY_API_KEY")
     if not key:
         return None
-    r = requests.post(
-        "https://api.tavily.com/search",
-        headers={"Authorization": f"Bearer {key}"},
-        json={"query": f'"{name}" {role} {company} experience', "max_results": 5},
-        timeout=30,
-    )
-    r.raise_for_status()
-    results = r.json().get("results", [])
-    if not results:
+
+    def search() -> dict:
+        r = requests.post(
+            "https://api.tavily.com/search",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"query": f'"{name}" {role} {company} experience', "max_results": 5},
+            timeout=30,
+        )
+        r.raise_for_status()
+        results = r.json().get("results", [])
+        if not results:
+            return {"bio": None}
+        snippets = "\n\n".join(f"[{x['url']}]\n{x.get('content', '')[:800]}" for x in results)
+        out = llm.gemini_json(BIO_PROMPT.format(name=name, role=role, company=company, snippets=snippets),
+                              purpose="bio", model=llm.GEMINI_LITE)
+        return out if out.get("bio") else {"bio": None}
+
+    try:
+        out = llm.cached([name.lower(), role.lower(), company.lower(), "bio-v1"], search)
+    except (llm.QuotaExhausted, llm.ModelUnavailable):
+        raise  # out of model quota: the card waits for the next run and gets its bio then
+    except Exception as e:
+        print(f"bio search for {name} failed: {type(e).__name__}: {e}")
         return None
-    snippets = "\n\n".join(f"[{x['url']}]\n{x.get('content', '')[:800]}" for x in results)
-    out = llm.gemini_json(BIO_PROMPT.format(name=name, role=role, company=company, snippets=snippets),
-                          purpose="bio", model=llm.GEMINI_LITE)
     return out if out.get("bio") else None
 
 
@@ -522,7 +538,7 @@ def generic_card(category: str, pdf: bytes | None, text: str, symbol: str, url: 
     return card
 
 
-# ---------------------------------------------------------------- driver
+# ---------------------------------------------------------------- checking a results reading
 
 class CheckFailed(ValueError):
     def __init__(self, message: str, card: dict | None = None):
@@ -531,7 +547,7 @@ class CheckFailed(ValueError):
 
 
 def _compare(card: dict, ref: dict | None) -> str | None:
-    """None when the card agrees with screener's quarter, else what differs."""
+    """None if the card agrees with screener's quarter, else what differs."""
     if not ref:
         return "screener has no figures for that quarter"
     rows = {r["metric"]: r["value"] for r in card["rows"]}
@@ -546,31 +562,12 @@ def _compare(card: dict, ref: dict | None) -> str | None:
     return None
 
 
-def _without_other_income(x: dict) -> bool:
-    """Revenue that equals total income has other income in it. Take it out of
-    every column where that is the case; False if the current column isn't."""
-    changed = False
-    for p in x["periods"]:
-        rev, total, other = p.get("revenue"), p.get("total_income"), p.get("other_income")
-        if rev is None or not other or (total is not None and abs(rev - total) > 0.005 * abs(total)):
-            continue
-        p["revenue"] = rev - other
-        changed = changed or p["role"] == "current"
-    return changed
-
-
-def _has_pbt(card: dict) -> bool:
-    return any(r["metric"] == "PBT" and r["value"] is not None for r in card["rows"])
-
-
 def cross_check(card: dict, symbol: str, period_end: str) -> dict:
-    """Compare the extracted quarter with screener's table, compiled independently
-    from the same filings. Revenue and PAT must agree; for banks, PAT only,
-    since screener's bank revenue line is defined differently.
+    """Compare the reading with screener's quarterly table. Revenue and PAT must
+    agree (PAT only for banks; screener defines bank revenue differently).
 
-    Filings carry both standalone and consolidated tables and readers sometimes
-    take one for the other, so a reading that matches the other basis is kept
-    and relabelled rather than thrown away."""
+    Filings have both a standalone and a consolidated table and readers mix them
+    up, so a reading that matches the other basis is kept and relabelled."""
     from pipeline import screener
 
     metrics = ["PAT"] if card["bank"] else ["Revenue", "PAT"]
@@ -588,20 +585,146 @@ def cross_check(card: dict, symbol: str, period_end: str) -> dict:
     raise CheckFailed(problem)
 
 
+def _without_other_income(x: dict) -> bool:
+    """If revenue equals total income, other income is inside it; take it out.
+    Returns False if the current quarter didn't need it."""
+    changed = False
+    for p in x["periods"]:
+        rev, total, other = p.get("revenue"), p.get("total_income"), p.get("other_income")
+        if rev is None or not other or (total is not None and abs(rev - total) > 0.005 * abs(total)):
+            continue
+        p["revenue"] = rev - other
+        changed = changed or p["role"] == "current"
+    return changed
+
+
+def _has_pbt(card: dict) -> bool:
+    return any(r["metric"] == "PBT" and r["value"] is not None for r in card["rows"])
+
+
+def _current(x: dict) -> dict:
+    p = next((p for p in x.get("periods", []) if p.get("role") == "current"), None)
+    if p is None:
+        raise ValueError("no current-quarter column found")
+    return p
+
+
+def _finish(x: dict, model: str, url: str, symbol: str) -> dict:
+    """Check one reading and return it ready to store, or raise.
+
+    It has to be complete and match screener on revenue and PAT. Two common
+    slips get fixed from the filing's own lines first: the wrong unit (the stated
+    one is tried first, then the others) and total income read as revenue. Only
+    a reading that matches can take screener's PBT or EBITDA for a line it
+    couldn't read, and it still needs a PBT at the end."""
+    stated = _normalise(x)["unit"]
+    units = [stated] * (stated in _TO_CRORE) + [u for u in _TO_CRORE if u != stated]
+    period_end = _current(x)["period_end"]
+    failure = None
+    for unit in units:
+        for repair in (False, True):
+            y = copy.deepcopy(x)
+            y["unit"] = unit
+            if repair and not _without_other_income(y):
+                continue
+            card = results_card(y, url, need_pbt=False)
+            try:
+                y["_check"] = cross_check(card, symbol, period_end)
+            except CheckFailed as e:
+                failure = failure or CheckFailed(str(e), card)
+                continue
+            y["basis"] = card["basis"]
+            notes = []
+            if unit != stated:
+                notes.append(f"the reader took the table to be in {stated}; {unit} is the scale that matches"
+                             if stated in _TO_CRORE else
+                             f"unit not stated by the reader; {unit} is the scale that matches")
+            if repair:
+                notes.append("the reader took total income for revenue, so other income was taken out")
+            if notes:
+                y["_note"] = "; ".join(notes)
+            if not _has_pbt(card) or any(r["value"] is None for r in card["rows"]):
+                y["_fill"] = screener_fill(y, card, symbol)
+            results_card(y, url)  # raises if there's still no PBT
+            y["_model"] = model
+            return y
+    raise failure
+
+
+def _agreed(disputed: list) -> dict | None:
+    """Two different models reading the same numbers is good evidence of what the
+    filing says, even if screener's table differs. Returns the first such reading."""
+    for i, (m1, x1, c1, why) in enumerate(disputed):
+        a = {r["metric"]: r["value"] for r in c1["rows"]}
+        for m2, _, c2, _ in disputed[i + 1:]:
+            b = {r["metric"]: r["value"] for r in c2["rows"]}
+            keys = [m for m in ("Revenue", "NII", "PAT") if a.get(m) is not None]
+            if keys and all(b.get(m) is not None and abs(a[m] - b[m]) <= 0.005 * abs(b[m]) + 0.5 for m in keys):
+                x1["_check"] = {"against": "screener", "metrics": [], "disputed": why, "readers": [m1, m2]}
+                x1["_model"] = m1
+                return x1
+    return None
+
+
+def read_results(url: str, content: bytes, symbol: str) -> dict:
+    """Try the models in turn until one reading passes _finish: full Flash first,
+    then Lite, then Groq on the page text. A reading that fails is never stored,
+    so a better model gets another go on a later run."""
+    pdf, pages = results_pages(content)
+    problems, disputed = [], []
+
+    def note_failure(model, e, x):
+        problems.append(f"{model}: {e}")
+        if isinstance(e, CheckFailed) and e.card and _has_pbt(e.card):
+            disputed.append((model, x, e.card, str(e)))
+        return _agreed(disputed)
+
+    for model in RESULTS_MODELS + llm.GEMINI_FALLBACKS:
+        try:
+            x = llm.gemini_json(RESULTS_PROMPT, purpose="results", model=model, fallback=False,
+                                pdf=pdf, schema=RESULTS_SCHEMA)
+        except (llm.QuotaExhausted, llm.ModelUnavailable):
+            continue
+        # The model numbers pages within the excerpt; map back to the filing.
+        if x.get("page") and 1 <= x["page"] <= len(pages):
+            x["page"] = pages[x["page"] - 1]
+        try:
+            return _finish(x, model, url, symbol)
+        except (ValueError, KeyError, StopIteration, TypeError) as e:
+            if (hit := note_failure(model, e, x)) is not None:
+                return hit
+
+    # Last go without Gemini: the table pages as text, to Groq's biggest model.
+    # Text loses the column layout, so it gets exactly the same checks.
+    text = _pages_text(pdf)
+    if text:
+        try:
+            x = llm.groq_json(RESULTS_PROMPT + RESULTS_TEXT_SUFFIX + text, purpose="results", model=llm.GROQ_LARGE)
+        except Exception as e:
+            raise llm.ModelUnavailable(f"groq: {e}") from e
+        x["page"] = pages[0] if pages else None
+        try:
+            return _finish(x, llm.GROQ_LARGE, url, symbol)
+        except (ValueError, KeyError, StopIteration, TypeError) as e:
+            if (hit := note_failure(llm.GROQ_LARGE, e, x)) is not None:
+                return hit
+    if problems:
+        raise ValueError("; ".join(problems)[:400])
+    raise llm.QuotaExhausted("no model free to read results")
+
+
+# ---------------------------------------------------------------- which PDF to read
+
 _NOT_THE_TABLE = ("presentation", "press release", "media release", "transcript", "audio",
                   "recording", "conference call", "earnings call", "newspaper", "investor meet")
 
 
 def results_candidates(story: dict) -> list[str]:
-    """Every PDF the company filed around this story, most likely table first.
+    """PDFs the company filed around this story, the likeliest statement first.
 
-    A results event is several filings, and the one stories.py leads with is
-    sometimes the press release or the deck, which carry headline numbers but
-    not the statement. The statement can also arrive under a subject that was
-    grouped elsewhere (Eternal's did), so this looks at the company's filings
-    in the story's date range, not only the story's own."""
-    from datetime import datetime, timedelta
-
+    The story's lead is sometimes the press release or the deck, and the
+    statement can sit in a filing that was grouped somewhere else (Eternal's
+    was), so this looks at all of the company's filings in that date range."""
     first = datetime.fromisoformat(story["first_at"]) - timedelta(days=2)
     last = datetime.fromisoformat(story.get("last_at") or story["first_at"]) + timedelta(days=2)
     rows = (db.client().table("filings").select("subject,detail,attachment_url,story_id")
@@ -610,9 +733,9 @@ def results_candidates(story: dict) -> list[str]:
 
     def rank(f):
         text = f"{f['subject']} {f.get('detail') or ''} {f['attachment_url']}".lower()
-        return (("result" in text and not any(w in text for w in _NOT_THE_TABLE)) * 4
-                + (f.get("story_id") == story["id"]) * 2
-                + ("outcome" in text) - any(w in text for w in _NOT_THE_TABLE) * 4)
+        not_table = any(w in text for w in _NOT_THE_TABLE)
+        return ("result" in text and not not_table) * 4 + (f.get("story_id") == story["id"]) * 2 \
+            + ("outcome" in text) - not_table * 4
 
     urls = [f["attachment_url"] for f in sorted(rows, key=rank, reverse=True)
             if (f.get("attachment_url") or "").lower().endswith(".pdf")]
@@ -622,8 +745,8 @@ def results_candidates(story: dict) -> list[str]:
 
 
 def pick_results_pdf(story: dict, enough: int = 7, tries: int = 6) -> tuple[str, bytes]:
-    """The candidate whose best page looks most like a results statement.
-    Stops at the first one that clearly is; no model call."""
+    """Download candidates until one clearly looks like a results statement, and
+    return the best one seen. No model call."""
     best = None
     for url in results_candidates(story)[:tries]:
         try:
@@ -640,170 +763,69 @@ def pick_results_pdf(story: dict, enough: int = 7, tries: int = 6) -> tuple[str,
     return best[1], best[2]
 
 
+def _results_key(url: str) -> list[str]:
+    return [url, PROMPT_VERSION, "results"]
+
+
+def _stored_reading(story: dict) -> tuple[str, dict] | None:
+    """A reading already stored for one of the story's PDFs that still passes
+    today's checks. Looking here first means a change of lead filing, or a
+    regrouped story, doesn't cost a model call."""
+    urls = [story.get("lead_url")] + results_candidates(story)
+    for url in dict.fromkeys(u for u in urls if u):
+        x = llm.lookup(_results_key(url))
+        if x is None:
+            continue
+        try:
+            card = results_card(copy.deepcopy(x), url)
+            if "_check" not in x:  # stored before the screener check existed
+                x["_check"] = cross_check(card, story["symbol"], _current(x)["period_end"])
+                x["basis"] = card["basis"]
+                llm.store(_results_key(url), x)
+            return url, x
+        except ValueError:
+            llm.forget(_results_key(url))  # fails today's checks, so it gets read again
+    return None
+
+
+def results_story_card(story: dict) -> dict:
+    hit = _stored_reading(story)
+    if hit:
+        url, x = hit
+    else:
+        url, content = pick_results_pdf(story)
+        x = llm.cached(_results_key(url), lambda: read_results(url, content, story["symbol"]))
+    card = results_card(x, url)
+    if x["_check"].get("metrics") and "_fill" not in x and any(r["value"] is None for r in card["rows"]):
+        # Matched screener on revenue and PAT, but a line wasn't read: use screener's figure, marked "s".
+        x["_fill"] = screener_fill(x, card, story["symbol"])
+        card = results_card(x, url)
+        llm.store(_results_key(url), x)
+    if (x.get("_check") or {}).get("relabelled"):
+        card["basis"] = x["_check"]["relabelled"].split(" → ")[1]
+    if x.get("_note"):
+        card["checks"].append(x["_note"][0].upper() + x["_note"][1:] + ".")
+    card["model"] = x.get("_model")
+    card["check"] = x.get("_check")
+    if card["check"] and card["check"].get("disputed"):
+        card["checks"].append(f"Two separate readings of the filing agree, but screener differs: "
+                              f"{card['check']['disputed']}.")
+        card["check"] = None
+    return card
+
+
+# ---------------------------------------------------------------- building cards
+
 def build(story: dict, company: str) -> dict:
     cat, url = story["category"], story.get("lead_url")
     if cat == "results":
         if not url:
             raise ValueError("results story without a PDF")
-        content = None
-        known = llm.lookup([url, PROMPT_VERSION, "results"])
-        try:
-            if known is None:
-                raise ValueError
-            results_card(copy.deepcopy(known), url)  # the lead's stored reading still passes: keep it
-        except ValueError:
-            url, content = pick_results_pdf(story)
-
-        def extract():
-            """Full Flash models first, then Lite. Every reading must agree with
-            screener before it is kept; a failed reading is never cached, so a
-            better model can try again later."""
-            pdf, pages = results_pages(content if content is not None else download(url))
-            problems = []
-            disputed = []  # (model, x, card, why): complete readings screener disagrees with
-
-            def agreed():
-                """Two different models reading the same numbers is strong evidence of
-                what the filing prints, even when screener's table differs."""
-                for i, (m1, x1, c1, why) in enumerate(disputed):
-                    for m2, x2, c2, _ in disputed[i + 1:]:
-                        a = {r["metric"]: r["value"] for r in c1["rows"]}
-                        b = {r["metric"]: r["value"] for r in c2["rows"]}
-                        keys = [m for m in ("Revenue", "NII", "PAT") if a.get(m) is not None]
-                        if keys and all(b.get(m) is not None and abs(a[m] - b[m]) <= 0.005 * abs(b[m]) + 0.5
-                                        for m in keys):
-                            x1["_check"] = {"against": "screener", "metrics": [], "disputed": why,
-                                            "readers": [m1, m2]}
-                            x1["_model"] = m1
-                            return x1
-                return None
-            def finish(x, model):
-                """Completeness, then screener's cross-check on revenue and PAT. Only a
-                reading that passes both may borrow screener's PBT and EBITDA for lines
-                it couldn't find; it still has to end up with a PBT.
-
-                Two reader slips are repaired from the filing's own lines, and the
-                repaired reading still has to match screener on both revenue and PAT:
-                a unit the reader didn't name (each scale is tried), and total income
-                taken for revenue (other income is taken back out)."""
-                stated = _normalise(x)["unit"]
-                # The stated unit first; readers also misread "₹ in million" as crore,
-                # so the other scales are tried when it fails. Both revenue and PAT
-                # have to match at the same scale, which a wrong scale won't do.
-                units = [stated] * (stated in _TO_CRORE) + [u for u in _TO_CRORE if u != stated]
-                current = next((p for p in x["periods"] if p["role"] == "current"), None)
-                if current is None:
-                    raise ValueError("no current-quarter column found")
-                failure = None
-                for unit in units:
-                    for repair in (False, True):
-                        y = copy.deepcopy(x)
-                        y["unit"] = unit
-                        if repair and not _without_other_income(y):
-                            continue
-                        card = results_card(y, url, need_pbt=False)
-                        try:
-                            y["_check"] = cross_check(card, story["symbol"], current["period_end"])
-                        except CheckFailed as e:
-                            failure = failure or CheckFailed(str(e), card)
-                            continue
-                        y["basis"] = card["basis"]
-                        notes = []
-                        if unit != stated:
-                            notes.append(f"unit not stated by the reader; {unit} is the scale that matches"
-                                         if stated not in _TO_CRORE else
-                                         f"the reader took the table to be in {stated}; {unit} is the scale that matches")
-                        if repair:
-                            notes.append("the reader took total income for revenue, so other income was taken out")
-                        if notes:
-                            y["_note"] = "; ".join(notes)
-                        if not _has_pbt(card) or any(r["value"] is None for r in card["rows"]):
-                            y["_fill"] = screener_fill(y, card, story["symbol"])
-                        results_card(y, url)  # raises if PBT is still missing
-                        y["_model"] = model
-                        return y
-                raise failure
-
-            for model in RESULTS_MODELS + llm.GEMINI_FALLBACKS:
-                try:
-                    x = llm.gemini_json(RESULTS_PROMPT, purpose="results", model=model, fallback=False,
-                                        pdf=pdf, schema=RESULTS_SCHEMA)
-                except (llm.QuotaExhausted, llm.ModelUnavailable):
-                    continue
-                # The model numbers pages within the excerpt; map back to the filing.
-                if x.get("page") and 1 <= x["page"] <= len(pages):
-                    x["page"] = pages[x["page"] - 1]
-                try:
-                    return finish(x, model)
-                except CheckFailed as e:
-                    problems.append(f"{model}: {e}")
-                    if e.card and _has_pbt(e.card):
-                        disputed.append((model, x, e.card, str(e)))
-                    if (hit := agreed()) is not None:
-                        return hit
-                except (ValueError, KeyError, StopIteration) as e:  # incomplete or malformed table
-                    problems.append(f"{model}: {e}")
-            # Last resort, no Gemini: the table pages' own text to Groq's largest
-            # model. Text loses the column layout, so this reading has to pass
-            # exactly the same completeness check and screener cross-check.
-            text = _pages_text(pdf)
-            if text:
-                try:
-                    x = llm.groq_json(RESULTS_PROMPT + RESULTS_TEXT_SUFFIX + text, purpose="results",
-                                      model=llm.GROQ_LARGE)
-                    x["page"] = pages[0] if pages else None
-                    return finish(x, llm.GROQ_LARGE)
-                except CheckFailed as e:
-                    problems.append(f"{llm.GROQ_LARGE}: {e}")
-                    if e.card and _has_pbt(e.card):
-                        disputed.append((llm.GROQ_LARGE, x, e.card, str(e)))
-                    if (hit := agreed()) is not None:
-                        return hit
-                except (ValueError, KeyError, StopIteration, TypeError) as e:
-                    problems.append(f"{llm.GROQ_LARGE}: {e}")
-                except Exception as e:  # rate limits and the like: try again on a later run
-                    raise llm.ModelUnavailable(f"groq: {e}") from e
-            if problems:
-                raise ValueError("; ".join(problems)[:400])
-            raise llm.QuotaExhausted("no model free to read results")
-
-        key = [url, PROMPT_VERSION, "results"]
-        x = llm.cached(key, extract)
-        try:
-            card = results_card(x, url)
-            if "_check" not in x:  # stored before the cross-check existed: check it now
-                current = next(p for p in x["periods"] if p["role"] == "current")
-                x["_check"] = cross_check(card, story["symbol"], current["period_end"])
-                x["basis"] = card["basis"]
-                llm.store(key, x)
-        except ValueError:
-            # A stored reading that fails today's checks is read again, from the
-            # PDF that looks most like a results statement.
-            llm.forget(key)
-            url, content = pick_results_pdf(story)
-            key = [url, PROMPT_VERSION, "results"]
-            x = llm.cached(key, extract)
-            card = results_card(x, url)
-        if (x["_check"].get("metrics") and "_fill" not in x
-                and any(r["value"] is None for r in card["rows"])):
-            # Passed on revenue and PAT but a line wasn't read: screener's figure, marked.
-            x["_fill"] = screener_fill(x, card, story["symbol"])
-            card = results_card(x, url)
-            llm.store(key, x)
-        if (x.get("_check") or {}).get("relabelled"):
-            card["basis"] = x["_check"]["relabelled"].split(" → ")[1]
-        if x.get("_note"):
-            card["checks"].append(x["_note"][0].upper() + x["_note"][1:] + ".")
-        card["model"] = x.get("_model")
-        card["check"] = x.get("_check")
-        if card["check"] and card["check"].get("disputed"):
-            card["checks"].append(f"Two independent readings of the filing agree, but screener differs: "
-                                  f"{card['check']['disputed']}.")
-            card["check"] = None
-        return card
+        return results_story_card(story)
     if cat == "management_change":
         if not url:
             raise ValueError("management change without a PDF")
+
         def extract():
             pdf = pdf_or_none(url, 6)
             prompt = LEADERSHIP_PROMPT if pdf else f"{LEADERSHIP_PROMPT}\n\nFiling text:\n{story['headline']}"
@@ -816,12 +838,28 @@ def build(story: dict, company: str) -> dict:
         cat, pdf_or_none(url, 4), story["headline"], story["symbol"], url))
 
 
-def process_pending(limit: int = 15) -> tuple[int, int, int]:
+def _try_later(e: Exception) -> bool:
+    """Quota, overload or a network blip: leave the story pending for the next run.
+    A 404 or a bad PDF won't fix itself, so those fail."""
+    if isinstance(e, (llm.QuotaExhausted, llm.ModelUnavailable, requests.ConnectionError, requests.Timeout)):
+        return True
+    response = getattr(e, "response", None)
+    return isinstance(e, requests.HTTPError) and response is not None and \
+        (response.status_code == 429 or response.status_code >= 500)
+
+
+def process_pending(limit: int = 15, budget_s: float | None = None) -> tuple[int, int, int]:
+    """Build cards for pending stories, most important first. With budget_s, no new
+    card is started after that many seconds, so an hourly run can't drag into the next."""
+    t0 = time.monotonic()
     names = {s["symbol"]: s["name"] for s in db.select("stocks", "symbol,name")}
     pending = db.client().table("stories").select("*").eq("card_status", "pending") \
         .order("base_score", desc=True).limit(limit).execute().data
     done = failed = skipped = 0
     for s in pending:
+        if budget_s is not None and time.monotonic() - t0 > budget_s:
+            print(f"card budget of {budget_s:.0f}s used up; the rest wait for the next run")
+            break
         if WEIGHT[s["category"]] < MIN_WEIGHT:
             update, skipped = {"card_status": "skipped"}, skipped + 1
         else:
@@ -829,14 +867,48 @@ def process_pending(limit: int = 15) -> tuple[int, int, int]:
                 card = build(s, names.get(s["symbol"], s["symbol"]))
                 update, done = {"card": card, "card_status": "done", "summary": card.get("summary")}, done + 1
                 print(f"{s['id']}: {card['type']} card ok")
-            except (llm.QuotaExhausted, llm.ModelUnavailable) as e:
-                print(f"{s['id']}: {e}; left pending for the next run")
-                continue
             except Exception as e:
+                if _try_later(e):
+                    print(f"{s['id']}: {type(e).__name__}: {e}; left pending for the next run")
+                    continue
                 print(f"{s['id']}: card failed: {type(e).__name__}: {e}")
                 update, failed = {"card": {"error": str(e)[:300]}, "card_status": "failed"}, failed + 1
         db.client().table("stories").update(update).eq("id", s["id"]).execute()
     return done, failed, skipped
+
+
+def _debug(symbol: str):
+    """What the reader is given for a symbol's latest results story, and what it returns."""
+    import json
+    import re
+
+    story = (db.client().table("stories").select("*").eq("symbol", symbol).eq("category", "results")
+             .order("first_at", desc=True).limit(1).execute().data[0])
+    print("lead:", story["lead_url"], "|", story.get("headline", "")[:80])
+    url, content = pick_results_pdf(story)
+    print("chosen:", url, "| statement strength", statement_strength(content))
+    pdf, pages = results_pages(content)
+    print("pages sent:", pages)
+    lines = [ln.strip() for ln in _pages_text(pdf, limit=60000).splitlines()]
+    wanted = re.compile(r"revenue|total income|other income|before tax|tax expense|profit for|net profit|"
+                        r"profit after|quarter ended|three months|crore|lakh|million", re.I)
+    for ln in [ln for ln in lines if wanted.search(ln)][:30]:
+        print("  |", re.sub(r"\s{2,}", "  ", ln)[:170])
+    x = llm.gemini_json(RESULTS_PROMPT, purpose="results", model=llm.GEMINI_LITE, pdf=pdf, schema=RESULTS_SCHEMA)
+    print("reader:", json.dumps({k: v for k, v in x.items() if k != "periods"}))
+    for per in x.get("periods", []):
+        print(" ", json.dumps({k: v for k, v in per.items() if v is not None}))
+
+
+def _show(story_id: str):
+    """Print the stored reading behind a results card."""
+    import json
+
+    story = db.client().table("stories").select("*").eq("id", story_id).execute().data[0]
+    url = ((story.get("card") or {}).get("source") or {}).get("url") or story["lead_url"]
+    print("read from:", url)
+    stored = llm.lookup(_results_key(url))
+    print(json.dumps(stored if stored is not None else "nothing stored", indent=1))
 
 
 if __name__ == "__main__":
@@ -847,42 +919,16 @@ if __name__ == "__main__":
     ap.add_argument("--limit", type=int, default=50)
     ap.add_argument("--retry-failed", action="store_true")
     ap.add_argument("--redo-results", action="store_true", help="rebuild every results card")
-    ap.add_argument("--show", metavar="STORY_ID", help="print the stored extraction for one story")
+    ap.add_argument("--show", metavar="STORY_ID", help="print the stored reading behind a results card")
     ap.add_argument("--debug", metavar="SYMBOL", help="show what a reader sees and returns for a results story")
     args = ap.parse_args()
     if args.debug:
-        import json
-        import re
-
-        story = (db.client().table("stories").select("*").eq("symbol", args.debug).eq("category", "results")
-                 .order("first_at", desc=True).limit(1).execute().data[0])
-        print("lead:", story["lead_url"], "|", story.get("headline", "")[:80])
-        url, content = pick_results_pdf(story)
-        print("chosen:", url, "| statement strength", statement_strength(content))
-        pdf, pages = results_pages(content)
-        print("pages sent:", pages)
-        lines = [ln.strip() for ln in _pages_text(pdf, limit=60000).splitlines()]
-        wanted = re.compile(r"revenue|total income|other income|before tax|tax expense|profit for|net profit|"
-                            r"profit after|quarter ended|three months|crore|lakh|million", re.I)
-        for ln in [ln for ln in lines if wanted.search(ln)][:30]:
-            print("  |", re.sub(r"\s{2,}", "  ", ln)[:170])
-        x = llm.gemini_json(RESULTS_PROMPT, purpose="results", model=llm.GEMINI_LITE, pdf=pdf, schema=RESULTS_SCHEMA)
-        print("reader:", json.dumps({k: v for k, v in x.items() if k != "periods"}))
-        for per in x.get("periods", []):
-            print(" ", json.dumps({k: v for k, v in per.items() if v is not None}))
-        raise SystemExit
-    if args.show:
-        import hashlib
-        import json
-
-        story = db.client().table("stories").select("*").eq("id", args.show).execute().data[0]
-        print("lead:", story["lead_url"])
-        key = hashlib.sha256("|".join([story["lead_url"], PROMPT_VERSION, "results"]).encode()).hexdigest()
-        hit = db.client().table("research_cache").select("value").eq("key", key).execute().data
-        print(json.dumps(hit[0]["value"] if hit else "no cached extraction", indent=1))
-        raise SystemExit
-    if args.redo_results:
-        db.client().table("stories").update({"card_status": "pending"}).eq("category", "results").execute()
-    if args.retry_failed:
-        db.client().table("stories").update({"card_status": "pending"}).eq("card_status", "failed").execute()
-    print("done %d, failed %d, skipped %d" % process_pending(args.limit))
+        _debug(args.debug)
+    elif args.show:
+        _show(args.show)
+    else:
+        if args.redo_results:
+            db.client().table("stories").update({"card_status": "pending"}).eq("category", "results").execute()
+        if args.retry_failed:
+            db.client().table("stories").update({"card_status": "pending"}).eq("card_status", "failed").execute()
+        print("done %d, failed %d, skipped %d" % process_pending(args.limit))

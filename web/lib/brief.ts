@@ -1,7 +1,8 @@
+import { day } from "./format";
 import type { Category, Rules, Signal, Stock, Story } from "./types";
 
-// Mirrors pipeline/stories.py WEIGHT. A story is material when its category
-// weight (without the position-size part of base_score) is at least 4.
+// Same numbers as WEIGHT in pipeline/stories.py. A story is material when its
+// category weight (base_score minus the position-size part) is at least 4.
 export const CATEGORY_WEIGHT: Record<Category, number> = {
   results: 10, "M&A": 9, management_change: 9, fund_raise: 8, litigation: 8, pledging: 8,
   capex: 7, insider_trading: 6, credit_rating: 6, press_release: 5, bonus_split: 5,
@@ -24,15 +25,15 @@ export type Window = { kind: WindowKind; day?: string };
 const HOUR = 36e5;
 const MOVE_BOOST = 3;
 
-/** The newest moment we have data for. Windows count back from here, not from
- *  the wall clock, so the Brief still shows a real day when ingest is paused. */
+/** The newest moment we have data for. Windows count back from here and not from
+ *  the clock, so the Brief still shows something real over a weekend or holiday. */
 export function anchorOf(stories: Story[], signals: Signal[]): number {
   const s = Math.max(0, ...stories.map((x) => Date.parse(x.last_at)));
   const p = Math.max(0, ...signals.map((x) => closeOf(x.date)));
   return Math.max(s, p) || Date.now();
 }
 
-/** NSE closes at 15:30 IST, which is 10:00 UTC. */
+/** NSE closes at 15:30 IST, 10:00 UTC. */
 export function closeOf(date: string): number {
   return Date.parse(`${date}T10:00:00Z`);
 }
@@ -65,14 +66,28 @@ export function tripped(s: Signal, r: Rules): { price: boolean; volume: boolean 
   return { price, volume };
 }
 
-/** Filings between the previous close and this close are the candidates for
- *  explaining a move: results after hours on Monday move the stock on Tuesday. */
-function explainers(s: Signal, stories: Story[]): Story[] {
+/** For each symbol and trading day, the trading day before it. Built from the
+ *  signals themselves, so weekends and market holidays come out right. */
+function previousDays(signals: Signal[]): Map<string, string> {
+  const bySymbol = new Map<string, string[]>();
+  for (const s of signals) bySymbol.set(s.symbol, [...(bySymbol.get(s.symbol) ?? []), s.date]);
+  const prev = new Map<string, string>();
+  for (const [symbol, days] of bySymbol) {
+    const sorted = [...new Set(days)].sort();
+    sorted.slice(1).forEach((d, i) => prev.set(`${symbol}|${d}`, sorted[i]));
+  }
+  return prev;
+}
+
+/** Material stories that started between the previous close and this one, most
+ *  important first. Results after hours on Friday explain Monday's move. Same
+ *  rule as driver() in pipeline/telegram.py. */
+function explainers(s: Signal, stories: Story[], prevDay: string | undefined, weights: Map<string, number>): Story[] {
   const end = closeOf(s.date);
-  const start = end - 30 * HOUR;
+  const start = prevDay ? closeOf(prevDay) : end - 30 * HOUR;
   return stories
-    .filter((x) => x.symbol === s.symbol && Date.parse(x.last_at) > start && Date.parse(x.first_at) <= end)
-    .filter((x) => CATEGORY_WEIGHT[x.category] >= 3)
+    .filter((x) => x.symbol === s.symbol && isMaterial(x, weights))
+    .filter((x) => Date.parse(x.first_at) > start && Date.parse(x.first_at) <= end)
     .sort((a, b) => b.base_score - a.base_score);
 }
 
@@ -116,14 +131,19 @@ export function buildBrief(
       return true;
     });
 
+  const prev = previousDays(signals);
   const moves: Move[] = signals
     .filter((s) => closeOf(s.date) >= from && closeOf(s.date) < to)
-    .map((s) => ({ ...s, ...tripped(s, rules), explainedBy: explainers(s, stories), stock: bySymbol.get(s.symbol) }))
+    .map((s) => ({
+      ...s, ...tripped(s, rules), stock: bySymbol.get(s.symbol),
+      explainedBy: explainers(s, stories, prev.get(`${s.symbol}|${s.date}`), weights),
+    }))
     .filter((m) => m.price || m.volume)
     .sort((a, b) => (b.stock?.weight ?? 0) * Math.abs(b.ret) - (a.stock?.weight ?? 0) * Math.abs(a.ret));
 
-  const moved = new Set(moves.map((m) => m.symbol));
-  const score = new Map(inRange.map((s) => [s.id, s.base_score + (moved.has(s.symbol) ? MOVE_BOOST : 0)]));
+  // A story moves up when it explains one of the moves, not just because the stock moved some other day.
+  const explaining = new Set(moves.flatMap((m) => m.explainedBy.map((x) => x.id)));
+  const score = new Map(inRange.map((s) => [s.id, s.base_score + (explaining.has(s.id) ? MOVE_BOOST : 0)]));
   const byScore = (a: Story, b: Story) =>
     score.get(b.id)! - score.get(a.id)! || Date.parse(b.last_at) - Date.parse(a.last_at);
 
@@ -135,12 +155,13 @@ export function buildBrief(
   };
 }
 
-/** One plain line, built from facts, saying why this card is in front of you. */
+/** One plain line of facts saying why this card is in front of you. */
 export function whyLine(s: Story, stock: Stock | undefined, moves: Move[]): string {
   const parts: string[] = [];
   if (stock) parts.push(`${stock.weight}% of portfolio`);
-  const m = moves.find((x) => x.symbol === s.symbol);
-  if (m) parts.push(`stock ${m.ret >= 0 ? "up" : "down"} ${Math.abs(m.ret).toFixed(1)}% that day`);
+  // The move this story explains, not just any move the stock made in the window.
+  const m = moves.find((x) => x.explainedBy.some((e) => e.id === s.id));
+  if (m) parts.push(`stock ${m.ret >= 0 ? "up" : "down"} ${Math.abs(m.ret).toFixed(1)}% on ${day(`${m.date}T12:00:00+05:30`)}`);
   const c = s.card;
   if (c && "type" in c && c.type === "results") {
     const top = c.rows[0];

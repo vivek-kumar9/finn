@@ -1,9 +1,9 @@
 import type { LeadershipCard, ResultsCard, Story, SummaryCard } from "@/lib/types";
-import { bps, crore, pct, rupees, tone } from "@/lib/format";
+import { bps, crore, inr, pct, rupees, tone } from "@/lib/format";
 
 const MARK_TITLE: Record<string, string> = {
-  EBITDA: "Derived: PBT + finance costs + depreciation − other income",
-  PBT: "Derived: PAT + tax expense, from the filing's own lines",
+  EBITDA: "Worked out: PBT + finance costs + depreciation - other income",
+  PBT: "Worked out: PAT + tax expense, from the filing's own lines",
 };
 
 function hasValue(card: ResultsCard, metric: string) {
@@ -69,8 +69,11 @@ export function ResultsGrid({ card }: { card: ResultsCard }) {
         {derived && <span> d: derived from the filing&rsquo;s lines</span>}
         {borrowed && <span> s: from screener, after revenue and PAT matched</span>}
       </p>
-      {card.check && (
-        <p className="source">{card.check.metrics.join(" and ")} match screener&rsquo;s quarterly table.</p>
+      {card.check && card.check.metrics.length > 0 && (
+        <p className="source">
+          {card.check.metrics.join(" and ")} {card.check.metrics.length === 1 ? "matches" : "match"} screener&rsquo;s
+          quarterly table.
+        </p>
       )}
     </div>
   );
@@ -121,7 +124,7 @@ function factValue(k: string, v: string | number): string {
   if (typeof v !== "number") return String(v);
   if (k.endsWith("_cr")) return rupees(v);
   if (k.endsWith("_pct")) return `${v}%`;
-  if (k === "per_share" || k === "issue_price") return `₹${v}`;
+  if (k === "per_share" || k === "issue_price") return inr(v);
   return String(v);
 }
 

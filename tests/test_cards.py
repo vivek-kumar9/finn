@@ -1,3 +1,5 @@
+import copy
+
 import pytest
 
 from pipeline.cards import fiscal_quarter, results_card
@@ -94,22 +96,48 @@ def test_numbers_returned_as_text_are_understood():
     assert rows["Revenue"]["value"] == 1200.0 and rows["PBT"]["qoq"] is None
 
 
-def test_two_models_agreeing_against_screener_is_shown_with_a_flag(monkeypatch):
+STORY = {"category": "results", "lead_url": "u", "symbol": "X", "id": "X:results:1",
+         "first_at": "2026-11-06T14:00:00+05:30", "last_at": "2026-11-06T14:00:00+05:30"}
+
+SCREENER_1200 = {"2026-09-30": {"sales": 1200.0, "pat": 150.0, "pbt": 200.0},
+                 "2026-06-30": {"sales": 1000.0, "pat": 110.0, "pbt": 150.0},
+                 "2025-09-30": {"sales": 960.0, "pat": 90.0, "pbt": 120.0}}
+
+
+def _stub(monkeypatch, reading, table, models=("a",)):
+    """No network and no database: every model returns `reading`, screener returns `table`."""
     from pipeline import cards, llm, screener
 
-    reading = extraction(unit="crore")  # revenue 120000 cr, PAT 15000 cr
     monkeypatch.setattr(cards, "download", lambda url: b"%PDF")
     monkeypatch.setattr(cards, "results_pages", lambda pdf: (b"%PDF", [3]))
     monkeypatch.setattr(cards, "_pages_text", lambda pdf: "")
-    monkeypatch.setattr(cards, "RESULTS_MODELS", ["a", "b"])
+    monkeypatch.setattr(cards, "RESULTS_MODELS", list(models))
+    monkeypatch.setattr(cards, "results_candidates", lambda story: [])
+    monkeypatch.setattr(cards, "pick_results_pdf", lambda story: ("u", b"%PDF"))
     monkeypatch.setattr(llm, "GEMINI_FALLBACKS", [])
-    monkeypatch.setattr(llm, "gemini_json", lambda *a, **k: __import__("copy").deepcopy(reading))
+    monkeypatch.setattr(llm, "gemini_json", lambda *a, **k: copy.deepcopy(reading))
     monkeypatch.setattr(llm, "cached", lambda key, fn, stats=None: fn())
     monkeypatch.setattr(llm, "lookup", lambda key: None)
-    monkeypatch.setattr(cards, "pick_results_pdf", lambda story: ("u", b"%PDF"))
-    monkeypatch.setattr(screener, "quarters", lambda s, b: {"2026-09-30": {"sales": 110000.0, "pat": 15000.0}})
+    monkeypatch.setattr(screener, "quarters", lambda s, b: table)
 
-    card = cards.build({"category": "results", "lead_url": "u", "symbol": "X", "id": "X:results:1"}, "X Ltd")
+
+def _build(monkeypatch, reading, table):
+    from pipeline import cards
+
+    _stub(monkeypatch, reading, table)
+    return cards.build(dict(STORY), "X Ltd")
+
+
+def values(card):
+    return {r["metric"]: r["value"] for r in card["rows"]}
+
+
+def test_two_models_agreeing_against_screener_is_shown_with_a_flag(monkeypatch):
+    from pipeline import cards
+
+    reading = extraction(unit="crore")  # revenue 120000 cr, PAT 15000 cr
+    _stub(monkeypatch, reading, {"2026-09-30": {"sales": 110000.0, "pat": 15000.0}}, models=("a", "b"))
+    card = cards.build(dict(STORY), "X Ltd")
     assert card["check"] is None
     assert any("screener differs" in c for c in card["checks"])
 
@@ -117,7 +145,7 @@ def test_two_models_agreeing_against_screener_is_shown_with_a_flag(monkeypatch):
 def test_standalone_table_read_as_consolidated_is_relabelled(monkeypatch):
     from pipeline import cards, screener
 
-    card = results_card(extraction(), "r.pdf")  # claims consolidated; revenue 1,200, PAT 150
+    card = results_card(extraction(), "r.pdf")  # says consolidated; revenue 1,200, PAT 150
     tables = {"consolidated": {"2026-09-30": {"sales": 1400.0, "pat": 170.0}},
               "standalone": {"2026-09-30": {"sales": 1200.0, "pat": 150.0}}}
     monkeypatch.setattr(screener, "quarters", lambda sym, basis: tables[basis])
@@ -130,8 +158,7 @@ def test_pbt_is_derived_from_pat_and_tax_when_not_printed():
     for p in x["periods"]:
         p["tax_expense"], p["pbt"], p["pbt_before_exceptional"] = p["pbt"] - p["pat"], None, None
     card = results_card(x, "r.pdf")
-    rows = {r["metric"]: r for r in card["rows"]}
-    assert rows["PBT"]["value"] == 200.0 and card["sourced"]["PBT"] == "derived"
+    assert values(card)["PBT"] == 200.0 and card["sourced"]["PBT"] == "derived"
 
 
 def test_missing_pbt_is_rejected_without_a_fill():
@@ -142,22 +169,6 @@ def test_missing_pbt_is_rejected_without_a_fill():
         results_card(x, "r.pdf")
 
 
-def _build_with(monkeypatch, reading, table):
-    from pipeline import cards, llm, screener
-
-    monkeypatch.setattr(cards, "download", lambda url: b"%PDF")
-    monkeypatch.setattr(cards, "results_pages", lambda pdf: (b"%PDF", [3]))
-    monkeypatch.setattr(cards, "_pages_text", lambda pdf: "")
-    monkeypatch.setattr(cards, "RESULTS_MODELS", ["a"])
-    monkeypatch.setattr(llm, "GEMINI_FALLBACKS", [])
-    monkeypatch.setattr(llm, "gemini_json", lambda *a, **k: __import__("copy").deepcopy(reading))
-    monkeypatch.setattr(llm, "cached", lambda key, fn, stats=None: fn())
-    monkeypatch.setattr(llm, "lookup", lambda key: None)
-    monkeypatch.setattr(cards, "pick_results_pdf", lambda story: ("u", b"%PDF"))
-    monkeypatch.setattr(screener, "quarters", lambda s, b: table)
-    return cards.build({"category": "results", "lead_url": "u", "symbol": "X", "id": "X:results:1"}, "X Ltd")
-
-
 def test_unread_pbt_comes_from_screener_only_after_revenue_and_pat_match(monkeypatch):
     reading = extraction(unit="crore")
     for p in reading["periods"]:
@@ -165,19 +176,14 @@ def test_unread_pbt_comes_from_screener_only_after_revenue_and_pat_match(monkeyp
     table = {"2026-09-30": {"sales": 120000.0, "pat": 15000.0, "pbt": 20000.0, "op_profit": 22000.0},
              "2026-06-30": {"sales": 100000.0, "pat": 11000.0, "pbt": 15000.0, "op_profit": 17000.0},
              "2025-09-30": {"sales": 96000.0, "pat": 9000.0, "pbt": 12000.0, "op_profit": 13500.0}}
-    card = _build_with(monkeypatch, reading, table)
+    card = _build(monkeypatch, reading, table)
     rows = {r["metric"]: r for r in card["rows"]}
     assert rows["PBT"]["value"] == 20000.0 and rows["PBT"]["qoq"] == pytest.approx(33.3, abs=0.1)
     assert card["sourced"] == {"PBT": "screener", "EBITDA": "screener"} and not card["ebitda_derived"]
 
-    table["2026-09-30"]["pat"] = 14000.0  # PAT disagrees: nothing is borrowed, the card fails
+    table["2026-09-30"]["pat"] = 14000.0  # PAT disagrees: nothing is borrowed and the card fails
     with pytest.raises(ValueError, match="PAT read as"):
-        _build_with(monkeypatch, reading, table)
-
-
-SCREENER_1200 = {"2026-09-30": {"sales": 1200.0, "pat": 150.0, "pbt": 200.0},
-                 "2026-06-30": {"sales": 1000.0, "pat": 110.0, "pbt": 150.0},
-                 "2025-09-30": {"sales": 960.0, "pat": 90.0, "pbt": 120.0}}
+        _build(monkeypatch, reading, table)
 
 
 def test_unit_names_are_understood():
@@ -185,23 +191,22 @@ def test_unit_names_are_understood():
     for p in x["periods"]:
         for key in ("revenue", "pbt", "pat"):
             p[key] *= 100_000  # the lakh fixture, in rupees
-    rows = {r["metric"]: r for r in results_card(x, "r.pdf")["rows"]}
-    assert rows["Revenue"]["value"] == 1200.0
+    assert values(results_card(x, "r.pdf"))["Revenue"] == 1200.0
 
 
 def test_unstated_unit_is_the_scale_that_matches_screener(monkeypatch):
-    card = _build_with(monkeypatch, extraction(unit="none"), SCREENER_1200)
-    assert {r["metric"]: r["value"] for r in card["rows"]}["Revenue"] == 1200.0
+    card = _build(monkeypatch, extraction(unit="none"), SCREENER_1200)
+    assert values(card)["Revenue"] == 1200.0
     assert any("unit not stated" in c.lower() for c in card["checks"])
 
 
 def test_total_income_taken_for_revenue_is_repaired(monkeypatch):
     reading = extraction()
     for p in reading["periods"]:
-        p["other_income"] = 7000  # about 6%, as in CDSL's ₹417 cr against ₹394 cr
+        p["other_income"] = 7000  # about 6%, like CDSL's 417 cr against 394 cr
         p["total_income"] = p["revenue"] = p["revenue"] + p["other_income"]
-    card = _build_with(monkeypatch, reading, SCREENER_1200)
-    assert {r["metric"]: r["value"] for r in card["rows"]}["Revenue"] == 1200.0
+    card = _build(monkeypatch, reading, SCREENER_1200)
+    assert values(card)["Revenue"] == 1200.0
     assert any("total income for revenue" in c for c in card["checks"])
 
 
@@ -218,38 +223,63 @@ def test_statement_beats_press_release_and_deck():
 
 
 def test_misstated_unit_is_corrected_only_when_both_lines_match(monkeypatch):
-    reading = extraction(unit="crore")  # the lakh fixture, claimed as crore: 100x too big
-    card = _build_with(monkeypatch, reading, SCREENER_1200)
-    assert {r["metric"]: r["value"] for r in card["rows"]}["Revenue"] == 1200.0
+    reading = extraction(unit="crore")  # the lakh fixture labelled crore: 100x too big
+    card = _build(monkeypatch, reading, SCREENER_1200)
+    assert values(card)["Revenue"] == 1200.0
     assert any("took the table to be in crore" in c for c in card["checks"])
 
     wrong_pat = {k: dict(v, pat=v["pat"] * 2) for k, v in SCREENER_1200.items()}
     with pytest.raises(ValueError, match="Revenue read as 120,000"):
-        _build_with(monkeypatch, extraction(unit="crore"), wrong_pat)
+        _build(monkeypatch, extraction(unit="crore"), wrong_pat)
 
 
-def test_stored_reading_gets_checked_filled_or_read_again(monkeypatch):
+def test_stored_reading_is_used_from_any_of_the_storys_pdfs(monkeypatch):
+    """A regrouped story with a new lead still finds the reading stored for its statement PDF."""
     from pipeline import cards, llm
 
-    old = extraction()  # stored before checks existed: no _check, no EBITDA inputs
+    table = {k: dict(v, op_profit=v["pbt"] + 20) for k, v in SCREENER_1200.items()}
+    _stub(monkeypatch, extraction(), table)
+    old = extraction()  # stored before the checks existed: no _check, and no finance costs
     for p in old["periods"]:
         p["finance_costs"] = None
-    table = {k: dict(v, op_profit=v["pbt"] + 20) for k, v in SCREENER_1200.items()}
-    stored = {}
+    store = {"statement.pdf": old}
     reads = []
-    _build_with(monkeypatch, old, table)  # installs the stubs
-    monkeypatch.setattr(llm, "cached", lambda key, fn, stats=None: stored.get("x") or fn())
-    monkeypatch.setattr(llm, "store", lambda key, value: stored.update(x=value))
-    monkeypatch.setattr(llm, "forget", lambda key: stored.clear())
-    monkeypatch.setattr(llm, "gemini_json", lambda *a, **k: reads.append(1) or __import__("copy").deepcopy(old))
+    monkeypatch.setattr(cards, "results_candidates", lambda story: ["statement.pdf"])
+    monkeypatch.setattr(llm, "lookup", lambda key: copy.deepcopy(store.get(key[0])))
+    monkeypatch.setattr(llm, "store", lambda key, value: store.update({key[0]: value}))
+    monkeypatch.setattr(llm, "forget", lambda key: store.pop(key[0], None))
+    monkeypatch.setattr(llm, "gemini_json", lambda *a, **k: reads.append(1) or copy.deepcopy(extraction()))
 
-    stored["x"] = __import__("copy").deepcopy(old)
-    card = cards.build({"category": "results", "lead_url": "u", "symbol": "X", "id": "X:results:1"}, "X Ltd")
-    rows = {r["metric"]: r["value"] for r in card["rows"]}
-    assert rows["EBITDA"] == 220.0 and card["sourced"] == {"EBITDA": "screener"} and not reads
-    assert stored["x"]["_check"]["metrics"] == ["Revenue", "PAT"]
+    card = cards.build(dict(STORY, lead_url="press-release.pdf"), "X Ltd")
+    assert not reads and card["source"]["url"] == "statement.pdf"
+    assert values(card)["EBITDA"] == 220.0 and card["sourced"] == {"EBITDA": "screener"}
+    assert store["statement.pdf"]["_check"]["metrics"] == ["Revenue", "PAT"]
 
-    stored["x"] = dict(__import__("copy").deepcopy(old), periods=[dict(p, pat=p["pat"] * 0.8) for p in old["periods"]])
-    stored["x"].pop("_check", None)
-    card = cards.build({"category": "results", "lead_url": "u", "symbol": "X", "id": "X:results:1"}, "X Ltd")
-    assert reads and {r["metric"]: r["value"] for r in card["rows"]}["PAT"] == 150.0
+
+def test_stored_reading_that_fails_todays_checks_is_read_again(monkeypatch):
+    from pipeline import cards, llm
+
+    _stub(monkeypatch, extraction(), SCREENER_1200)
+    wrong = extraction()
+    for p in wrong["periods"]:
+        p["pat"] *= 0.8  # screener has 150, this says 120
+    store = {"u": wrong}
+    reads = []
+    monkeypatch.setattr(llm, "lookup", lambda key: copy.deepcopy(store.get(key[0])))
+    monkeypatch.setattr(llm, "store", lambda key, value: store.update({key[0]: value}))
+    monkeypatch.setattr(llm, "forget", lambda key: store.pop(key[0], None))
+    monkeypatch.setattr(llm, "gemini_json", lambda *a, **k: reads.append(1) or copy.deepcopy(extraction()))
+
+    card = cards.build(dict(STORY), "X Ltd")
+    assert reads and values(card)["PAT"] == 150.0
+
+
+def test_network_trouble_leaves_a_card_pending():
+    import requests
+
+    from pipeline import cards, llm
+
+    assert cards._try_later(llm.ModelUnavailable("busy"))
+    assert cards._try_later(requests.ConnectionError())
+    gone = requests.HTTPError(response=type("R", (), {"status_code": 404})())
+    assert not cards._try_later(gone)

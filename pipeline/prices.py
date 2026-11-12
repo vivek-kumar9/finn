@@ -25,10 +25,10 @@ def download(symbols: list[str], period: str = "6mo") -> dict[str, pd.DataFrame]
 
 
 def signals(df: pd.DataFrame, index: pd.DataFrame | None) -> pd.DataFrame:
-    """One row per day: return, return vs index, volatility, z-score, volume multiple.
+    """One row per day: return, return vs the index, volatility, z-score, volume multiple.
 
-    Volatility and average volume use the previous LOOKBACK days only, so a
-    big day doesn't dampen its own alert.
+    Volatility and average volume only use the LOOKBACK days before, so a big
+    day doesn't water down its own alert.
     """
     out = pd.DataFrame(index=df.index)
     out["ret"] = df["Close"].pct_change() * 100

@@ -47,3 +47,14 @@ def test_transcript_never_leads_a_results_story():
     ]
     stories, _ = build(fs, {})
     assert stories[0]["lead_url"] == "o.pdf"
+
+
+def test_statement_leads_over_press_release_and_deck():
+    # CDSL's results story used to lead with "Media Release relating to financial results".
+    fs = [
+        filing("1", "CDSL", "10-31", "results", "Press Release", "Media Release relating to financial results", "m.pdf"),
+        filing("2", "CDSL", "10-31", "results", "Outcome of Board Meeting", "approved the financial results", "o.pdf"),
+        filing("3", "CDSL", "10-31", "results", "Investor Presentation", "Earnings presentation on financial results", "p.pdf"),
+    ]
+    stories, _ = build(fs, {})
+    assert stories[0]["lead_url"] == "o.pdf"

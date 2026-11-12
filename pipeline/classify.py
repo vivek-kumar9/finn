@@ -1,8 +1,8 @@
-"""Map an NSE announcement to one of the 17 categories in the brief's glossary.
+"""Put each NSE announcement into one of the 17 categories from the brief.
 
-Most NSE subjects are formulaic ("Outcome of Board Meeting", "Credit Rating"),
-so ordered regex rules handle the bulk for free. Whatever falls through goes
-to a small model in one batched call (see classify_with_model).
+NSE subjects are pretty formulaic ("Outcome of Board Meeting", "Credit Rating"),
+so regex rules catch most of them. Whatever is left goes to a small model in
+one batched call (with_model below).
 """
 import re
 
@@ -15,10 +15,16 @@ CATEGORIES = [
     "agm_egm", "pledging", "unclassified",
 ]
 
-# Order matters: first match wins. Routine paperwork goes first because it
-# often mentions results ("trading window closed for financial results").
+# First match wins. Routine paperwork comes first because it often mentions
+# results ("trading window closed till the financial results").
+# Board meeting notices are routine too: "meeting on 6 Nov to consider results"
+# is a date, not results. Keeping them out of results stories means the story
+# starts when the numbers come out, which the move-explaining in the app needs.
 _RULES = [
-    ("unclassified", r"trading window|loss of share cert|duplicate share|"
+    ("unclassified", r"board meeting intimation|intimation of (the )?board meeting|board meeting to be held|"
+                     r"meeting of the board .{0,60}(to be held|will be held|is scheduled)|"
+                     r"\bto announce\b.{0,40}results|"
+                     r"trading window|loss of share cert|duplicate share|"
                      r"regulation 74\s*\(5\)|depositories and participants|compliance certificate|"
                      r"\besops?\b|\besos\b|\besps\b|employee stock|secretarial compliance|"
                      r"business responsibility|\bbrsr\b|\besg\b|sustainability report|investor complaint|"

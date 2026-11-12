@@ -26,7 +26,7 @@ const store = {
     try {
       localStorage.setItem(`finn.${k}`, JSON.stringify(v));
     } catch {
-      /* private mode: preferences just won't stick */
+      /* private mode: settings just won't be saved */
     }
   },
 };
@@ -57,7 +57,7 @@ export default function Brief() {
     setPinned(store.get("pinned", []));
     setWin(store.get("window", { kind: "since" }));
     setLastVisit(store.get<number | null>("lastVisit", null));
-    // The visit that just started becomes "last visit" when the page is left.
+    // This visit becomes the "last visit" once the page is hidden or closed.
     const leave = () => document.visibilityState === "hidden" && store.set("lastVisit", Date.now());
     document.addEventListener("visibilitychange", leave);
     loadBrief().then(setData).catch((e) => setError(String(e.message ?? e)));
@@ -357,8 +357,8 @@ function MoveRow({ move: m, onOpen }: { move: Move; onOpen: (s: Story) => void }
       </div>
       <p className="move-facts">
         {m.ret_vs_index !== null && <>Nifty-relative {pct(m.ret_vs_index)}. </>}
-        {m.z !== null && <>{Math.abs(m.z).toFixed(1)}× its usual daily move. </>}
-        {m.vol_mult !== null && <>Volume {m.vol_mult.toFixed(1)}× its 20-day average.</>}
+        {m.z !== null && <>{Math.abs(m.z).toFixed(1)}x its usual daily move. </>}
+        {m.vol_mult !== null && <>Volume {m.vol_mult.toFixed(1)}x its 20-day average.</>}
       </p>
       {lead ? (
         <button className="explain" onClick={() => onOpen(lead)}>

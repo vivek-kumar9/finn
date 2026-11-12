@@ -1,5 +1,7 @@
 import json
 import os
+import re
+import threading
 import time
 from collections import defaultdict, deque
 
@@ -7,16 +9,16 @@ from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-# The pipeline pulls in pandas, yfinance, pypdf and the Supabase client. On a
-# free instance that takes long enough to miss Render's port check, so the API
-# binds first and imports the pipeline only when a job actually runs.
+# The pipeline imports pandas, yfinance, pypdf and the Supabase client. On a free
+# instance that's slow enough to miss Render's port check, so the API starts
+# first and only imports the pipeline when a job actually runs.
 STARTED = time.time()
 app = FastAPI(title="FINN API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
 print("finn-api: app created", flush=True)
 
-# A public link can burn the free model quota. Research runs are cheap when
-# cached, so the limit is generous but finite.
+# Anyone with the link can start a research run, and each new company uses free
+# model quota. Cached runs cost nothing, so the limit can be generous.
 RESEARCH_PER_HOUR = int(os.environ.get("RESEARCH_PER_HOUR", 12))
 _recent: dict[str, deque] = defaultdict(deque)
 
@@ -50,18 +52,32 @@ def run_probe(x_token: str | None = Header(default=None)):
     return {"host": "render", "results": probe.run()}
 
 
-def _ingest(days: int):
-    t0 = time.time()
-    from pipeline import ingest
+# A slow run (Gemini timing out, say) can outlast the hour. Two runs at once would
+# do the same work twice and race on the stories table, so the later one is skipped.
+_ingest_running = threading.Lock()
 
-    print(f"finn-api: pipeline imported in {time.time() - t0:.1f}s", flush=True)
-    ingest.run(days)
+
+def _ingest(days: int):
+    if not _ingest_running.acquire(blocking=False):
+        print("finn-api: previous ingest still running, skipping this one", flush=True)
+        return
+    try:
+        t0 = time.time()
+        from pipeline import ingest
+
+        print(f"finn-api: pipeline imported in {time.time() - t0:.1f}s", flush=True)
+        ingest.run(days)
+    finally:
+        _ingest_running.release()
 
 
 @app.post("/ingest", status_code=202)
 def run_ingest(background: BackgroundTasks, days: int = 3, x_token: str | None = Header(default=None)):
     _admin(x_token)
-    background.add_task(_ingest, min(days, 60))
+    if _ingest_running.locked():
+        return {"started": False, "reason": "previous run still going"}
+    days = max(1, min(days, 60))
+    background.add_task(_ingest, days)
     return {"started": True, "days": days}
 
 
@@ -86,8 +102,14 @@ def search(q: str):
     return screener.search(q.strip())
 
 
+# NSE symbols: letters, digits and a few marks (M&M, BAJAJ-AUTO).
+_SYMBOL = re.compile(r"[A-Za-z0-9&_.-]{1,20}")
+
+
 @app.get("/research/{symbol}")
 def research(symbol: str, request: Request):
+    if not _SYMBOL.fullmatch(symbol):
+        raise HTTPException(status_code=400, detail="That doesn't look like an NSE symbol.")
     ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "?").split(",")[0]
     if _limited(ip):
         raise HTTPException(status_code=429, detail="Too many research runs from this address; try again in an hour.")
@@ -95,7 +117,7 @@ def research(symbol: str, request: Request):
     def stream():
         from pipeline import research as r
 
-        yield ": start\n\n"  # flushes headers through proxies right away
+        yield ": start\n\n"  # gets the headers through proxies straight away
         try:
             for event, payload in r.run(symbol):
                 yield f"event: {event}\ndata: {json.dumps(payload, default=str)}\n\n"

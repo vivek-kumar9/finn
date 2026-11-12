@@ -1,4 +1,4 @@
-"""Indian fiscal calendar: FY27 runs April 2026 to March 2027."""
+"""Indian fiscal years: FY27 runs from April 2026 to March 2027."""
 import re
 from datetime import date
 
@@ -18,13 +18,13 @@ def quarter_end(fy: int, q: int) -> date:
 
 
 def label(d: date) -> str:
-    """Quarter-end date → 'Q2 FY27'."""
+    """Quarter-end date to a label like 'Q2 FY27'."""
     q = {6: 1, 9: 2, 12: 3, 3: 4}.get(d.month)
     return f"Q{q} FY{fy_of(d) % 100:02d}" if q else d.strftime("%b %Y")
 
 
 def parse(period: str) -> tuple[str, int, int | None] | None:
-    """'FY27' → ('fy', 2027, None); 'Q3 FY27' → ('q', 2027, 3); 'H2 FY27' → ('h', 2027, 2)."""
+    """'FY27' gives ('fy', 2027, None), 'Q3 FY27' gives ('q', 2027, 3), 'H2 FY27' gives ('h', 2027, 2)."""
     m = _PERIOD.match(period.strip().replace("-", " "))
     if not m:
         return None

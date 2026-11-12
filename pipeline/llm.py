@@ -1,8 +1,9 @@
-"""Thin model clients. Every call is logged to the usage table.
+"""Small clients for Gemini and Groq. Every call is logged to the usage table.
 
-Model IDs come from the environment so they can follow whatever the free
-tiers offer this week without a code change.
+Model IDs can be overridden from the environment, because the free tiers keep
+changing which models they offer.
 """
+import hashlib
 import json
 import os
 import threading
@@ -59,18 +60,23 @@ def _log(provider: str, model: str, purpose: str, tokens_in: int | None, tokens_
 def groq_json(prompt: str, purpose: str, model: str = GROQ_SMALL, retries: int = 3) -> dict:
     for attempt in range(retries):
         _groq_bucket.wait()
-        r = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {os.environ['GROQ_API_KEY']}"},
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "response_format": {"type": "json_object"},
-                "temperature": 0,
-            },
-            timeout=60,
-        )
-        if r.status_code == 429 and attempt < retries - 1:
+        try:
+            r = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {os.environ['GROQ_API_KEY']}"},
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0,
+                },
+                timeout=60,
+            )
+        except requests.RequestException as e:
+            raise ModelUnavailable(f"groq {model}: {type(e).__name__}") from e
+        if r.status_code == 429:
+            if attempt == retries - 1:
+                raise ModelUnavailable(f"groq {model}: still rate limited")
             time.sleep(float(r.headers.get("retry-after", 5 * (attempt + 1))))
             continue
         _raise_for(r, "groq", model)
@@ -98,7 +104,7 @@ class QuotaExhausted(RuntimeError):
 
 
 class ModelUnavailable(RuntimeError):
-    """Overloaded (503) or too slow. Another model will usually answer."""
+    """Overloaded, rate limited, too slow or unreachable. Another model will usually answer."""
 
 
 def gemini_json(prompt: str, purpose: str, model: str = GEMINI_FLASH, fallback: bool = True, **kw) -> dict:
@@ -116,9 +122,8 @@ def gemini_json(prompt: str, purpose: str, model: str = GEMINI_FLASH, fallback: 
 def _gemini(prompt: str, purpose: str, model: str,
             pdf: bytes | None = None, schema: dict | None = None, retries: int = 2,
             think: str = "low") -> dict:
-    """think: "low" for copying facts out of a document, "high" for judgment calls.
-    Reading a results table doesn't need a long chain of thought, and Gemini 3.x
-    thinks hard by default, which made 8-page extractions run past three minutes."""
+    """think: "low" for copying numbers out of a document, "high" for judgment calls.
+    Gemini 3 thinks hard by default, and that pushed 8-page extractions past three minutes."""
     parts = [{"text": prompt}]
     if pdf is not None:
         import base64
@@ -142,6 +147,8 @@ def _gemini(prompt: str, purpose: str, model: str,
             )
         except requests.Timeout:
             raise ModelUnavailable(f"gemini {model}: no answer in 90 s")
+        except requests.RequestException as e:
+            raise ModelUnavailable(f"gemini {model}: {type(e).__name__}") from e
         if r.status_code == 400 and "thinking" in r.text.lower() and "thinkingConfig" in config:
             config.pop("thinkingConfig")  # model doesn't take the setting; run without it
             continue
@@ -150,7 +157,9 @@ def _gemini(prompt: str, purpose: str, model: str,
         if r.status_code in (500, 503):
             # Overload is per model; waiting rarely helps, switching does.
             raise ModelUnavailable(f"gemini {model}: HTTP {r.status_code}, overloaded")
-        if r.status_code == 429 and attempt < retries - 1:
+        if r.status_code == 429:
+            if attempt == retries - 1:
+                raise ModelUnavailable(f"gemini {model}: still rate limited")
             time.sleep(10)
             continue
         _raise_for(r, "gemini", model)
@@ -162,59 +171,48 @@ def _gemini(prompt: str, purpose: str, model: str,
     raise RuntimeError(f"gemini {model}: out of retries")
 
 
-def lookup(key_parts: list[str]):
-    """A stored output, or None. Never computes."""
-    import hashlib
+def _cache_key(parts: list[str]) -> str:
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
+
+def lookup(key_parts: list[str]):
+    """The stored output for these inputs, or None. Never calls a model."""
     from pipeline import db
 
-    key = hashlib.sha256("|".join(key_parts).encode()).hexdigest()
-    hit = db.client().table("research_cache").select("value").eq("key", key).execute().data
+    hit = db.client().table("research_cache").select("value").eq("key", _cache_key(key_parts)).execute().data
     return hit[0]["value"] if hit else None
 
 
 def store(key_parts: list[str], value):
-    """Overwrite a stored output, e.g. with a check added after it was made."""
-    import hashlib
-
     from pipeline import db
 
-    key = hashlib.sha256("|".join(key_parts).encode()).hexdigest()
-    db.upsert("research_cache", [{"key": key, "value": value}], on_conflict="key")
+    db.upsert("research_cache", [{"key": _cache_key(key_parts), "value": value}], on_conflict="key")
 
 
 def forget(key_parts: list[str]):
-    """Drop a stored output, e.g. one that no longer passes stricter checks."""
-    import hashlib
-
+    """Drop a stored output, e.g. one that fails a check added later."""
     from pipeline import db
 
-    key = hashlib.sha256("|".join(key_parts).encode()).hexdigest()
-    db.client().table("research_cache").delete().eq("key", key).execute()
+    db.client().table("research_cache").delete().eq("key", _cache_key(key_parts)).execute()
 
 
 def cached(key_parts: list[str], fn, stats: dict | None = None):
-    """Return a stored model output for these inputs, or compute and store it.
-    stats, if given, counts hits and misses for the caller's cost line."""
-    import hashlib
-
-    from pipeline import db
-
-    key = hashlib.sha256("|".join(key_parts).encode()).hexdigest()
-    hit = db.client().table("research_cache").select("value").eq("key", key).execute().data
-    if hit:
+    """Return the stored output for these inputs, or compute it with fn and store it.
+    stats, if given, counts hits and misses for the cost line."""
+    value = lookup(key_parts)
+    if value is not None:
         if stats is not None:
             stats["hits"] = stats.get("hits", 0) + 1
-        return hit[0]["value"]
+        return value
     if stats is not None:
         stats["misses"] = stats.get("misses", 0) + 1
     value = fn()
-    db.upsert("research_cache", [{"key": key, "value": value}], on_conflict="key")
+    store(key_parts, value)
     return value
 
 
 if __name__ == "__main__":
-    # python -m pipeline.llm  → which model IDs actually answer for these keys
+    # python -m pipeline.llm   shows which model IDs answer for your keys right now
     from dotenv import load_dotenv
 
     load_dotenv()

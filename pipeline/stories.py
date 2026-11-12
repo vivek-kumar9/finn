@@ -1,13 +1,13 @@
 """Group filings into stories and score them.
 
-One results event arrives as five to seven filings (board-meeting notice,
-outcome, results PDF, deck, newspaper ad, call notice, transcript). The
-investor cares about the event, so the Brief shows one card per story.
+One results event comes as five to seven filings (outcome, results PDF, press
+release, deck, newspaper ad, call notice, transcript). You care about the
+event, so the Brief shows one card per story.
 
-A filing joins a story when it has the same symbol and category and lands
-within WINDOW days of the story's *first* filing. Anchoring on the first
-filing (not the last) keeps stories from chaining forever and keeps story
-ids stable between runs.
+A filing joins a story if it has the same symbol and category and was filed
+within WINDOW days of the story's first filing. Counting from the first filing
+and not the last stops stories from chaining forever, and keeps ids stable
+between runs.
 """
 import re
 from datetime import datetime, timedelta
@@ -90,6 +90,10 @@ def _story(g: dict, position_weight: float) -> dict:
     }
 
 
+# These carry headline numbers but not the full statement.
+_NOT_THE_STATEMENT = ("press release", "media release", "presentation", "newspaper", "advertisement")
+
+
 def _lead_rank(category: str, f: dict) -> int:
     """Which filing in a story is worth opening. Higher is better."""
     text = f"{f['subject']} {f.get('detail') or ''}".lower()
@@ -101,10 +105,10 @@ def _lead_rank(category: str, f: dict) -> int:
     if category == "results":
         if f.get("category") == "earnings_call":
             rank -= 6  # a call transcript is never the results document
-        elif "financial result" in text and "intimation" not in text:
+        elif any(w in text for w in _NOT_THE_STATEMENT):
+            rank += 1
+        elif ("financial result" in text or "outcome" in text) and "intimation" not in text:
             rank += 5
-        elif "presentation" in text:
-            rank += 3
     return rank
 
 

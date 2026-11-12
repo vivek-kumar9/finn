@@ -94,7 +94,7 @@ def test_constant_currency_guidance_is_not_judged_on_rupee_revenue():
 
 
 def test_operating_margin_means_ebit():
-    # Q2 FY27: op 21, depreciation 3, sales 128 → EBIT 14.1%, EBITDA 16.4%
+    # Q2 FY27: op 21, depreciation 3, sales 128, so EBIT 14.1% and EBITDA 16.4%
     p = promise("ebitda_margin", "Q2 FY27", 15)
     p.promise, p.quote = "Operating margin of 15%", "operating margin should be about 15%"
     v = judge(p, QUARTERS)

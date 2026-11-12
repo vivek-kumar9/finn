@@ -1,7 +1,7 @@
 """NSE corporate announcements.
 
-The JSON API needs the cookies NSE sets on its homepage, and it starts
-returning 401/403 once they go stale, so the session re-warms on failure.
+The JSON API wants the cookies NSE sets on its homepage, and starts returning
+401/403 once they go stale, so the session visits the homepage again when that happens.
 """
 import time
 from datetime import date, datetime
@@ -46,7 +46,7 @@ class NSE:
                 continue
             r.raise_for_status()
             rows = [parse(row) for row in r.json() if row.get("seq_id")]
-            # Don't trust the date filter blindly; without it NSE returns years of history.
+            # NSE sometimes ignores the dates and sends years of history, so filter again here.
             return [f for f in rows if f["filed_at"][:10] >= start.isoformat()]
         return []
 

@@ -70,7 +70,11 @@ export default function Research({ symbol }: { symbol: string }) {
       es.close();
     });
     es.onerror = () => {
-      if (!got.current) setS((p) => ({ ...p, fail: "The research server didn’t answer. It may be waking up; reload in a minute." }));
+      // Before any data: the server is asleep or busy. After some: the connection dropped halfway.
+      const fail = got.current
+        ? "The connection dropped before the run finished. Reload to finish it; what's done is cached."
+        : "The research server didn't answer. It may be waking up, so reload in a minute.";
+      setS((p) => (p.ended ? p : { ...p, fail, progress: undefined }));
       es.close();
     };
     return () => {
@@ -123,11 +127,11 @@ export default function Research({ symbol }: { symbol: string }) {
 }
 
 function range(r: Row) {
-  if (r.unit !== "pct" && r.unit !== "crore") return "";  // "$1 billion" stays in the words
-  const u = r.unit === "pct" ? "%" : r.unit === "crore" ? " cr" : "";
+  if (r.unit !== "pct" && r.unit !== "crore") return ""; // "$1 billion" stays in the words
+  const u = r.unit === "pct" ? "%" : " cr";
   const pre = r.unit === "crore" ? "₹" : "";
   const f = (v: number) => (r.unit === "crore" ? crore(v) : String(v));
-  if (r.low != null && r.high != null && r.low !== r.high) return `${pre}${f(r.low)}–${f(r.high)}${u}`;
+  if (r.low != null && r.high != null && r.low !== r.high) return `${pre}${f(r.low)}-${f(r.high)}${u}`;
   if (r.low != null) return `${r.high == null ? "at least " : ""}${pre}${f(r.low)}${u}`;
   if (r.high != null) return `up to ${pre}${f(r.high)}${u}`;
   return "";
@@ -139,7 +143,7 @@ function Ledger({ data }: { data?: State["ledger"] }) {
   const good = checkable.filter((r) => r.status === "met" || r.status === "on_track").length;
   const cuts = data.rows.filter((r) => r.revisions.some((v) => v.direction === "cut")).length;
   const dropped = data.calls.reduce((a, c) => a + (c.dropped ?? 0), 0);
-  // Promises reported numbers can test lead; segment and long-range ones fold away.
+  // Promises the reported numbers can test come first; segment ones fold away.
   const segment = data.rows.filter((r) => r.status === "unverifiable" && r.basis?.startsWith("Segment"));
   const shown = data.rows.filter((r) => !segment.includes(r));
   const lead =
@@ -168,8 +172,8 @@ function Ledger({ data }: { data?: State["ledger"] }) {
         <p className="foot">
           Read the last {data.calls.length} earnings calls
           {data.calls.length > 1 && `, ${data.calls[0].call_period} to ${data.calls[data.calls.length - 1].call_period}`}.
-          {dropped > 0 && ` ${dropped} ${dropped === 1 ? "quote was" : "quotes were"} dropped because the words couldn’t be found in the transcript.`}
-          {data.calls.some((c) => c.error) && " Some transcripts couldn’t be opened."}
+          {dropped > 0 && ` ${dropped} ${dropped === 1 ? "quote was" : "quotes were"} dropped because the words couldn't be found in the transcript.`}
+          {data.calls.some((c) => c.error) && " Some transcripts couldn't be opened."}
         </p>
       )}
     </section>
@@ -247,21 +251,20 @@ function Bars({ values, labels }: { values: (number | null)[]; labels: string[] 
 function Trajectory({ n }: { n: Numbers }) {
   const q = n.quarters;
   const g = n.growth;
-  const top = n.bank ? "Revenue" : "Revenue";
+  const lede = [
+    g.sales_3y != null && `Revenue ${pct(g.sales_3y)} a year over 3 years${g.sales_5y != null ? `, ${pct(g.sales_5y)} over 5` : ""}`,
+    g.pat_3y != null && `Net profit ${pct(g.pat_3y)} a year over 3 years`,
+  ].filter(Boolean);
   return (
     <section aria-labelledby="traj">
       <h2 id="traj">Trajectory</h2>
-      <p className="lede">
-        {g.sales_3y != null && `Revenue ${pct(g.sales_3y)} a year over 3 years`}
-        {g.sales_5y != null && `, ${pct(g.sales_5y)} over 5`}
-        {g.pat_3y != null && `. Net profit ${pct(g.pat_3y)} a year over 3 years`}.
-      </p>
+      {lede.length > 0 && <p className="lede">{lede.join(". ")}.</p>}
       <Bars values={q.map((x) => x.sales)} labels={q.map((x) => x.label)} />
       <table className="num">
-        <thead><tr><th scope="col"><span className="sr">Quarter</span></th><th scope="col">{top}</th><th scope="col">{n.bank ? "Margin" : "EBITDA %"}</th><th scope="col">PAT</th></tr></thead>
+        <thead><tr><th scope="col"><span className="sr">Quarter</span></th><th scope="col">Revenue</th><th scope="col">{n.bank ? "Margin" : "EBITDA %"}</th><th scope="col">PAT</th></tr></thead>
         <tbody>
           {[...q].reverse().map((x) => (
-            <tr key={x.label}><th scope="row">{x.label}</th><td>{crore(x.sales)}</td><td>{x.opm != null ? `${x.opm}%` : "–"}</td><td>{crore(x.pat)}</td></tr>
+            <tr key={x.label}><th scope="row">{x.label}</th><td>{crore(x.sales)}</td><td>{x.opm != null ? `${x.opm}%` : "-"}</td><td>{crore(x.pat)}</td></tr>
           ))}
         </tbody>
       </table>
@@ -272,7 +275,7 @@ function Trajectory({ n }: { n: Numbers }) {
 
 function Balance({ n }: { n: Numbers }) {
   const wc = n.working_capital;
-  // Service companies carry no inventory; rows that are empty every year are dropped.
+  // Service companies have no inventory, so rows that are empty every year are dropped.
   const names = ["Debtor Days", "Inventory Days", "Days Payable", "Cash Conversion Cycle"]
     .filter((k) => wc[k] && wc[k].some(([, v]) => v != null));
   const cols = names.length ? wc[names[0]].map(([c]) => c) : [];
@@ -283,7 +286,7 @@ function Balance({ n }: { n: Numbers }) {
         <thead><tr><th scope="col"><span className="sr">Year</span></th><th scope="col">Equity</th><th scope="col">Debt</th><th scope="col">D/E</th></tr></thead>
         <tbody>
           {[...n.balance].reverse().map((b) => (
-            <tr key={b.label}><th scope="row">{b.label}</th><td>{crore(b.equity)}</td><td>{crore(b.debt)}</td><td>{b.de ?? "–"}</td></tr>
+            <tr key={b.label}><th scope="row">{b.label}</th><td>{crore(b.equity)}</td><td>{crore(b.debt)}</td><td>{b.de ?? "-"}</td></tr>
           ))}
         </tbody>
       </table>
@@ -294,7 +297,7 @@ function Balance({ n }: { n: Numbers }) {
           <tbody>
             {names.map((k) => (
               <tr key={k}><th scope="row">{k.replace("Cash Conversion Cycle", "Cash cycle")}</th>
-                {wc[k].map(([c, v]) => <td key={c}>{v != null ? Math.round(v) : "–"}</td>)}</tr>
+                {wc[k].map(([c, v]) => <td key={c}>{v != null ? Math.round(v) : "-"}</td>)}</tr>
             ))}
           </tbody>
         </table>
@@ -309,8 +312,8 @@ function Cash({ n }: { n: Numbers }) {
   const pat = n.cash.reduce((a, c) => a + (c.pat ?? 0), 0);
   const lede =
     r == null ? null
-    : cfo < 0 ? `Over five years, operations used ₹${crore(-cfo)} cr of cash while the company reported ₹${crore(pat)} cr of net profit. Growth is being funded, not earned.`
-    : `Cash from operations was ${r}× net profit over five years. ${
+    : cfo < 0 ? `Over five years, operations used ₹${crore(-cfo)} cr of cash while the company reported ₹${crore(pat)} cr of net profit, so the profit hasn't turned into cash.`
+    : `Cash from operations was ${r}x net profit over five years. ${
         r >= 0.9 ? "Profits are turning into cash." : r >= 0.7 ? "Most profit turns into cash, with some leakage." : "Reported profit is running well ahead of cash."}`;
   return (
     <section aria-labelledby="cash">

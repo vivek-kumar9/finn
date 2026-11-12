@@ -23,7 +23,7 @@ def insert(table: str, rows: list[dict]):
 
 
 def select(table: str, columns: str = "*", **filters) -> list[dict]:
-    """Small helper for equality filters plus gte_<col> / in_<col>."""
+    """Equality filters, plus gte_<col> and in_<col>. Pages through results past 1000 rows."""
     def query():
         q = client().table(table).select(columns)
         for key, value in filters.items():

@@ -1,6 +1,6 @@
--- FINN schema. Paste into Supabase → SQL editor and run. Safe to re-run.
--- The browser reads with the anon key (select-only via RLS); everything
--- else is written by the pipeline with the service key, which bypasses RLS.
+-- FINN schema. Paste into the Supabase SQL editor and run it. Safe to run again.
+-- The browser reads with the anon key (select only, via RLS). Everything else
+-- is written by the pipeline with the service key, which bypasses RLS.
 
 create table if not exists stocks (
     symbol       text primary key,
@@ -22,9 +22,9 @@ create table if not exists prices (
     primary key (symbol, date)
 );
 
--- One row per stock per trading day. Raw signals only; thresholds are
--- applied by whoever reads them (the app, or the Telegram sender), so a
--- user changing their rules re-ranks instantly without re-ingesting.
+-- One row per stock per trading day. Only the raw numbers: thresholds are
+-- applied by whoever reads them (the app or the Telegram sender), so changing
+-- your rules re-ranks straight away, with no new ingest.
 create table if not exists signals (
     symbol       text not null,
     date         date not null,
@@ -47,7 +47,7 @@ create table if not exists stories (
     filing_count int not null default 1,
     lead_url     text,              -- the most informative attachment
     base_score   numeric not null,  -- category weight + position weight
-    card         jsonb,             -- type-specific payload, see contract/
+    card         jsonb,             -- depends on the category, see web/lib/types.ts
     card_status  text not null default 'pending', -- pending / done / failed / skipped
     updated_at   timestamptz not null default now()
 );
@@ -85,7 +85,7 @@ create table if not exists sent_alerts (
 );
 
 create table if not exists research_cache (
-    key        text primary key,     -- sha256(source url + prompt version)
+    key        text primary key,     -- sha256 of the source url, prompt version and kind
     value      jsonb not null,
     created_at timestamptz not null default now()
 );

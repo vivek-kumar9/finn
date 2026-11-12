@@ -1,4 +1,4 @@
-"""The demo portfolio. Weights are made up but shaped like a real long-only book."""
+"""The demo portfolio. The weights are made up, but shaped like a real long-only fund."""
 
 INDEX = "^NSEI"
 

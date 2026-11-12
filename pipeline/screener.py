@@ -1,8 +1,8 @@
-"""Standardised financials and document links from screener.in.
+"""Financial tables and document links from screener.in.
 
-Screener is used for two things only: its multi-year tables (which are
-compiled from the company's filings) and links to the company's own annual
-reports and concall transcripts. Its commentary and summaries are not used.
+Only two things come from screener: its multi-year tables (put together from
+the company's filings) and links to the company's own annual reports and call
+transcripts. None of its commentary or summaries.
 """
 import re
 import time
@@ -39,7 +39,7 @@ def _num(text: str) -> float | None:
 
 
 def _label(cell) -> str:
-    # Row labels carry an expand button ("Sales +"); keep the words only.
+    # Row labels have an expand button in them ("Sales +"); keep just the words.
     text = cell.get_text(" ", strip=True).replace("\xa0", " ")
     return re.sub(r"\s*\+\s*$", "", text).strip()
 
@@ -103,7 +103,7 @@ def fetch(symbol: str) -> dict:
 
 
 def quarters(symbol: str, basis: str) -> dict[str, dict]:
-    """Quarter-end date → {sales, pat} from the consolidated or standalone page."""
+    """Quarterly numbers keyed by quarter-end date, from the consolidated or standalone page."""
     key = f"{symbol.upper()}:{basis}"
     hit = _cache.get(key)
     if hit and time.time() - hit[0] < TTL:

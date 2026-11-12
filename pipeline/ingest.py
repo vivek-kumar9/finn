@@ -1,7 +1,8 @@
-"""One ingest pass: prices → signals → filings → categories → stories.
+"""One ingest run: prices and signals, new filings, categories, stories, cards, alerts.
 
     python -m pipeline.ingest --days 30      # backfill
-    python -m pipeline.ingest                # routine run (last 3 days)
+    python -m pipeline.ingest                # normal run (last 3 days)
+    python -m pipeline.ingest --reclassify   # after changing the rules
 """
 import argparse
 import time
@@ -13,7 +14,8 @@ from pipeline import cards, classify, db, prices, stories
 from pipeline.nse import NSE
 from pipeline.portfolio import HOLDINGS, INDEX, SYMBOLS, WEIGHTS
 
-STORY_LOOKBACK_DAYS = 60  # filings loaded to rebuild stories; > any story window
+STORY_LOOKBACK_DAYS = 60  # filings loaded to rebuild stories; longer than any story window
+CARD_BUDGET_S = 600       # an hourly run stops starting new cards after 10 minutes
 
 
 def run(days: int = 3) -> str:
@@ -40,7 +42,7 @@ def _run(days: int) -> str:
     n_prices = _prices(days)
     n_new, n_rule, n_model = _filings(days)
     n_stories = _stories()
-    done, failed, _ = cards.process_pending(limit=15)
+    done, failed, _ = cards.process_pending(limit=15, budget_s=CARD_BUDGET_S)
     try:
         from pipeline import telegram
 
@@ -73,7 +75,9 @@ def _prices(days: int) -> int:
 def _filings(days: int) -> tuple[int, int, int]:
     nse = NSE()
     end, start = date.today(), date.today() - timedelta(days=days)
-    known = {r["id"] for r in db.select("filings", "id", gte_filed_at=start.isoformat())}
+    # NSE's dates are IST and the database's are UTC, so look a day further back
+    # or filings from early on the start date get counted (and classified) twice.
+    known = {r["id"] for r in db.select("filings", "id", gte_filed_at=(start - timedelta(days=1)).isoformat())}
 
     fresh = []
     for sym in SYMBOLS:
@@ -99,27 +103,31 @@ def _filings(days: int) -> tuple[int, int, int]:
 
 
 def reclassify() -> str:
-    """Re-run rules, then the model, on filings the rules missed earlier."""
+    """Run the current rules over recent filings again, then rebuild the stories.
+
+    Rules cost nothing, so every filing is checked. The model only sees filings
+    a rule used to catch and no longer does; the ones it labelled before keep
+    their label."""
     since = (datetime.now(timezone.utc) - timedelta(days=STORY_LOOKBACK_DAYS)).isoformat()
-    rows = db.select("filings", "id,subject,detail", classified_by="model", gte_filed_at=since)
-    by_rule, leftovers = {}, []
+    rows = db.select("filings", "id,subject,detail,category,classified_by", gte_filed_at=since)
+    changes: dict[tuple[str, str], list[str]] = {}
+    leftovers = []
     for f in rows:
         cat = classify.by_rules(f["subject"], f["detail"])
-        if cat:
-            by_rule.setdefault(cat, []).append(f["id"])
-        else:
+        if cat and (cat, "rule") != (f["category"], f["classified_by"]):
+            changes.setdefault((cat, "rule"), []).append(f["id"])
+        elif not cat and f["classified_by"] == "rule":
             leftovers.append(f)
-    by_model: dict[str, list[str]] = {}
     for f, label in zip(leftovers, classify.with_model([(f["subject"], f["detail"]) for f in leftovers])):
-        by_model.setdefault(label, []).append(f["id"])
+        changes.setdefault((label, "model"), []).append(f["id"])
 
-    for source, groups in (("rule", by_rule), ("model", by_model)):
-        for cat, ids in groups.items():
+    for (cat, source), ids in changes.items():
+        for i in range(0, len(ids), 200):
             db.client().table("filings").update({"category": cat, "classified_by": source}) \
-                .in_("id", ids).execute()
+                .in_("id", ids[i:i + 200]).execute()
     n = _stories()
-    return (f"{sum(map(len, by_rule.values()))} now by rules, "
-            f"{len(leftovers)} by model {dict((k, len(v)) for k, v in by_model.items())}, {n} stories")
+    moved = {f"{cat} ({source})": len(ids) for (cat, source), ids in changes.items()}
+    return f"{sum(moved.values())} filings relabelled {moved}, {len(leftovers)} sent to the model, {n} stories"
 
 
 def _stories() -> int:
@@ -128,8 +136,8 @@ def _stories() -> int:
                         gte_filed_at=since)
     built, assignment = stories.build(filings, WEIGHTS)
 
-    # A story whose lead document changed (e.g. the results PDF arrived after
-    # the board-meeting notice) needs its card rebuilt.
+    # A story whose lead document changed (say the results PDF came after the
+    # press release) needs its card rebuilt.
     existing = {s["id"]: s["lead_url"] for s in db.select("stories", "id,lead_url", gte_last_at=since)}
     for s in built:
         if s["id"] not in existing or existing[s["id"]] != s["lead_url"]:
@@ -139,8 +147,8 @@ def _stories() -> int:
     db.upsert("stories", [s for s in built if "card_status" in s], on_conflict="id")
     db.upsert("stories", [s for s in built if "card_status" not in s], on_conflict="id")
 
-    # Stories that no longer exist after regrouping (e.g. a filing moved to
-    # another category) would otherwise linger as duplicates.
+    # Stories that no longer exist after regrouping (a filing moved to another
+    # category, say) would otherwise hang around as duplicates.
     built_ids = {s["id"] for s in built}
     stale = [sid for sid in existing if sid not in built_ids]
     if stale:
@@ -161,6 +169,6 @@ if __name__ == "__main__":
     load_dotenv()
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=3)
-    ap.add_argument("--reclassify", action="store_true", help="re-run rules and model on earlier leftovers")
+    ap.add_argument("--reclassify", action="store_true", help="run the current rules over recent filings again")
     args = ap.parse_args()
     print(reclassify()) if args.reclassify else run(args.days)

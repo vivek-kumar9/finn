@@ -22,7 +22,7 @@ const LOOKBACK_DAYS = 45;
 
 export async function loadBrief(): Promise<BriefData> {
   const c = db();
-  if (!c) return loadSample(); // local development without keys
+  if (!c) return loadSample(); // running locally without keys
 
   const since = new Date(Date.now() - LOOKBACK_DAYS * 864e5).toISOString();
   const [stories, stocks, signals, runs] = await Promise.all([

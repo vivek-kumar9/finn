@@ -1,11 +1,11 @@
-"""On-demand research for any NSE symbol, streamed section by section.
+"""Research on any NSE company, sent to the app one section at a time.
 
-Sources: screener's multi-year tables (compiled from filings), the company's
-latest annual report and its last four concall transcripts. Nothing else:
-no news, no broker notes, and no model background knowledge. Every model
-output is cached by document, so a second run of the same company is free.
+Sources: screener's multi-year tables (compiled from filings), the latest annual
+report and the last four earnings-call transcripts. No news, no broker notes and
+nothing from the model's own memory. Model output is cached per document, so
+the second run for a company is free.
 
-    python -m pipeline.research KAYNES     # prints each section as it lands
+    python -m pipeline.research KAYNES     # prints each section as it comes
 """
 import io
 import json
@@ -38,10 +38,9 @@ def _download(url: str, max_mb: int = 40) -> bytes:
 
 
 def _strong(prompt: str, purpose: str, lite_ok: bool = False, **kw) -> dict:
-    """Full Flash models in turn. Documents can fall back to the Lite models
-    when lite_ok (prose, with every quote verified afterwards); text-only
-    prompts fall back to Groq's largest open model. The model that answered
-    is recorded on the result."""
+    """Try the full Flash models in turn. With lite_ok a document can go to the
+    Lite models too (fine for transcripts, since every quote is checked after).
+    Text-only prompts fall back to Groq. The result records which model answered."""
     chain = STRONG_MODELS + (llm.GEMINI_FALLBACKS if lite_ok else [])
     for model in chain:
         try:
@@ -88,8 +87,8 @@ def numbers(page: dict) -> dict:
     pat = _series(a, "Net Profit")
     opm = _series(a, "OPM %", "Financing Margin %")
 
-    # A bank's "financing profit" on screener is after interest and provisions
-    # and often negative, so operating margin and D/E are left out for banks.
+    # Screener's "financing profit" for a bank is after interest and provisions,
+    # and often negative, so banks get no operating margin or D/E.
     quarters = [{**q, "label": fiscal.label(date.fromisoformat(q["end"])),
                  "opm": round(q["op_profit"] / q["sales"] * 100, 1)
                  if not bank and q["sales"] and q["op_profit"] is not None else None}
@@ -174,7 +173,7 @@ def facts(n: dict) -> list[dict]:
         cfo = sum(x["cfo"] for x in n["cash"] if x["cfo"] is not None)
         pat = sum(x["pat"] for x in n["cash"] if x["pat"] is not None)
         add(f"Operations used ₹{-cfo:,.0f} cr of cash over 5 years against ₹{pat:,.0f} cr of net profit" if cfo < 0
-            else f"Cash from operations was {n['cash_5y_ratio']}× net profit over 5 years")
+            else f"Cash from operations was {n['cash_5y_ratio']}x net profit over 5 years")
     roce = n["working_capital"].get("ROCE %")
     if roce and roce[-1][1] is not None:
         add(f"ROCE {roce[-1][1]:.0f}% in {roce[-1][0]}")
@@ -313,8 +312,8 @@ def run(symbol: str) -> Iterator[tuple[str, dict]]:
         yield "ledger", {"rows": [], "calls": [], "note": note}
     if calls_meta:
         yield "progress", {"text": f"Reading the last {len(calls_meta)} earnings calls"}
-    # Transcripts are independent, so they're read side by side; each one is
-    # cached by URL, so only new calls ever reach a model.
+    # The transcripts don't depend on each other, so they're read in parallel.
+    # Each is cached by URL, so only a new call ever goes to a model.
     results: dict[str, dict] = {}
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = {pool.submit(read_call, c["transcript"], stats): c for c in calls_meta}
@@ -361,7 +360,9 @@ def run(symbol: str) -> Iterator[tuple[str, dict]]:
         yield "views", {"error": f"{type(e).__name__}: {e}"[:200], "facts": all_facts}
 
     try:
-        used = db.client().table("usage").select("tokens_in,tokens_out").gte("at", started.isoformat()).execute().data
+        # Only this run's kinds of call, so an ingest running at the same time isn't counted.
+        used = (db.client().table("usage").select("tokens_in,tokens_out").gte("at", started.isoformat())
+                .in_("purpose", ["guidance", "snapshot", "views"]).execute().data)
     except Exception:
         used = []
     yield "cost", {

@@ -1,7 +1,7 @@
 """Check which data sources answer from the machine this runs on.
 
-NSE in particular is known to block cloud IPs, so we run this from the
-laptop, from Render and from GitHub Actions before deciding where ingest lives.
+NSE is known to block cloud IPs, so I ran this from my laptop, from Render and
+from GitHub Actions before deciding where the ingest should run.
 
     python -m pipeline.probe
 """
@@ -24,7 +24,7 @@ BSE_HEADERS = {
     "Accept": "application/json, text/plain, */*",
 }
 
-# Later checks reuse URLs found by earlier ones (e.g. a PDF link from the API).
+# Later checks reuse URLs that earlier ones found (a PDF link from the API, say).
 state: dict[str, str] = {}
 
 
@@ -160,7 +160,7 @@ def run() -> list[dict]:
         t0 = time.perf_counter()
         try:
             detail, ok = check(), True
-        except Exception as e:  # we want every failure reported, not raised
+        except Exception as e:  # report every failure instead of stopping at the first
             detail, ok = f"{type(e).__name__}: {e}"[:160], False
         ms = round((time.perf_counter() - t0) * 1000)
         results.append({"source": name, "ok": ok, "ms": ms, "detail": detail})

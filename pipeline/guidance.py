@@ -1,10 +1,10 @@
 """Promised vs delivered.
 
-1. A model reads each concall transcript and lists management's quantified,
-   forward-looking statements, each with a verbatim quote and page number.
-2. Code checks every quote against the PDF's own text and drops the ones it
-   can't find, so the ledger never cites something the call didn't say.
-3. Code, not the model, compares each promise with reported numbers.
+1. A model reads each call transcript and lists what management promised with
+   a number attached, with the exact quote and page.
+2. Every quote is looked up in the PDF's own text; any that can't be found are
+   dropped, so the ledger never quotes something nobody said.
+3. Python, not the model, checks each promise against the reported numbers.
 """
 import io
 import re
@@ -87,9 +87,9 @@ def _norm(s: str) -> str:
 
 
 def verify(quote: str, page: int, pages: list[str], threshold: float = 88) -> int | None:
-    """Return the 1-based page where the quote really is, or None.
+    """The 1-based page the quote is really on, or None.
 
-    Checks the claimed page first, then its neighbours (models are often off
+    Checks the page the model gave, then the pages either side (it's often off
     by one), then the whole document."""
     q = _norm(quote)
     if len(q) < 12:
@@ -152,11 +152,11 @@ def _growth(now: float | None, before: float | None) -> float | None:
 
 
 def judge(p: Promise, quarters: list[Quarter]) -> Verdict:
-    """Compare a promise with reported quarterly numbers.
+    """Check a promise against the reported quarterly numbers.
 
-    A finished period is met or missed. A period under way is on or off track
-    against the quarters reported so far (YTD). Margins and growth carry half a
-    point of tolerance, since management rounds when they speak."""
+    A finished period is met or missed. A period still under way is on or off
+    track, going by the quarters reported so far. Margins and growth get half a
+    point of slack, since management rounds when they talk."""
     if p.scope != "company":
         name = f" ({p.segment})" if p.segment else ""
         return Verdict("unverifiable", None, f"Segment guidance{name}; reported numbers are company-wide")
@@ -166,7 +166,7 @@ def judge(p: Promise, quarters: list[Quarter]) -> Verdict:
     if p.metric in ("revenue_growth", "revenue") and _CURRENCY.search(said):
         return Verdict("unverifiable", None,
                        "Guided in constant currency or dollars; reported revenue is in rupees, so the two don't compare")
-    # "Operating margin" in Indian IT and many others means EBIT, after depreciation.
+    # "Operating margin" in Indian IT (and plenty of others) means EBIT, after depreciation.
     ebit = p.metric == "ebitda_margin" and "ebitda" not in said and bool(_EBIT.search(said))
     span = fiscal.quarters_in(p.period)
     if span is None:
@@ -208,7 +208,7 @@ def judge(p: Promise, quarters: list[Quarter]) -> Verdict:
 
     if actual is None:
         return Verdict("open", None, "Reported numbers incomplete")
-    # "At least X" and ranges are judged on the floor; "up to X" on the ceiling.
+    # "At least X" and ranges are judged on the low end, "up to X" on the high end.
     hit = actual >= p.low - tol if p.low is not None else actual <= p.high + tol
     if done:
         return Verdict("met" if hit else "missed", shown)
@@ -226,10 +226,10 @@ def _key(item: dict) -> tuple[str, ...]:
 
 
 def ledger(calls: list[dict], quarters: list[Quarter]) -> list[dict]:
-    """calls: oldest first, each {"call_period", "url", "items": [verified items]}.
+    """calls: oldest first, each {"call_period", "url", "items": [checked items]}.
 
-    One row per (metric, period). The latest statement is the promise of
-    record; earlier different statements become its revision history."""
+    One row per metric and period. The latest statement is the one that counts;
+    earlier, different ones become its revision history."""
     rows: dict[tuple[str, str], Promise] = {}
     for call in calls:
         for it in call["items"]:

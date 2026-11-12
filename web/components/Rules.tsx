@@ -4,15 +4,15 @@ import { useEffect, useRef, useState } from "react";
 import type { AlertMode, Rules } from "@/lib/types";
 
 const MODES: { mode: AlertMode; label: string; help: string }[] = [
-  { mode: "volatility", label: "Unusual for the stock", help: "Compares the day’s move with the stock’s own typical daily move over 20 days. A 3% day is noise for some stocks and news for others." },
+  { mode: "volatility", label: "Unusual for the stock", help: "Compares the day's move with the stock's own typical daily move over 20 days. A 3% day is noise for some stocks and news for others." },
   { mode: "vs_index", label: "Against Nifty", help: "Ignores moves the whole market made. A 3% fall on a day Nifty fell 2.5% is not about the company." },
   { mode: "fixed", label: "Fixed percentage", help: "Any day the stock moves more than the set percentage." },
 ];
 
 const BOT = process.env.NEXT_PUBLIC_TELEGRAM_BOT;
 
-/** Rules travel to the bot in the /start parameter, which allows only
- *  letters, digits, _ and -. Numbers go as tenths: 2.5 → 25. */
+/** The rules go to the bot in the /start parameter, which only allows letters,
+ *  digits, _ and -. Numbers are sent in tenths, so 2.5 becomes 25. */
 function startParam(r: Rules): string {
   const m = r.mode === "fixed" ? "f" : r.mode === "vs_index" ? "i" : "v";
   return [m, Math.round(r.zMult * 10), Math.round(r.movePct * 10), Math.round(r.volMult * 10)].join("_");
@@ -20,10 +20,10 @@ function startParam(r: Rules): string {
 
 export function rulesSentence(r: Rules): string {
   const price =
-    r.mode === "volatility" ? `moves bigger than ${r.zMult}× the stock’s usual day`
+    r.mode === "volatility" ? `moves bigger than ${r.zMult}x the stock's usual day`
     : r.mode === "vs_index" ? `moves of ${r.movePct}% or more against Nifty`
     : `moves of ${r.movePct}% or more`;
-  return `Showing ${price}, or volume ${r.volMult}× its 20-day average.`;
+  return `Showing ${price}, or volume ${r.volMult}x its 20-day average.`;
 }
 
 export function RulesSheet(props: {
@@ -59,7 +59,7 @@ export function RulesSheet(props: {
             </label>
           ))}
           {r.mode === "volatility" ? (
-            <Slider label="Times the usual daily move" value={r.zMult} min={1.5} max={4} step={0.5} unit="×"
+            <Slider label="Times the usual daily move" value={r.zMult} min={1.5} max={4} step={0.5} unit="x"
                     onChange={(v) => setR({ ...r, zMult: v })} />
           ) : (
             <Slider label={r.mode === "vs_index" ? "Move against Nifty" : "Move"} value={r.movePct} min={1} max={10}
@@ -69,7 +69,7 @@ export function RulesSheet(props: {
 
         <fieldset>
           <legend>Volume</legend>
-          <Slider label="Times the 20-day average" value={r.volMult} min={1.5} max={5} step={0.5} unit="×"
+          <Slider label="Times the 20-day average" value={r.volMult} min={1.5} max={5} step={0.5} unit="x"
                   onChange={(v) => setR({ ...r, volMult: v })} />
         </fieldset>
 
