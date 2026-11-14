@@ -58,3 +58,13 @@ def test_statement_leads_over_press_release_and_deck():
     ]
     stories, _ = build(fs, {})
     assert stories[0]["lead_url"] == "o.pdf"
+
+
+def test_two_appointments_a_week_apart_are_two_stories():
+    # HDFC Bank: a compliance officer on 6 Nov, an RBI approval for another director on 12 Nov.
+    fs = [
+        filing("1", "HDFCBANK", "11-06", "management_change", "Change in Management", "CCO appointed", "a.pdf"),
+        filing("2", "HDFCBANK", "11-12", "management_change", "Change in Management", "RBI approval", "b.pdf"),
+    ]
+    stories, _ = build(fs, {})
+    assert len(stories) == 2

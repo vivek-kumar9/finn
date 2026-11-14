@@ -16,6 +16,7 @@ from pipeline.portfolio import HOLDINGS, INDEX, SYMBOLS, WEIGHTS
 
 STORY_LOOKBACK_DAYS = 60  # filings loaded to rebuild stories; longer than any story window
 CARD_BUDGET_S = 600       # an hourly run stops starting new cards after 10 minutes
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def run(days: int = 3) -> str:
@@ -56,6 +57,15 @@ def _run(days: int) -> str:
             f"{n_stories} stories, {done} cards built, {failed} failed, {n_alerts} alerts, in {secs:.0f}s")
 
 
+def unfinished_day(now: datetime | None = None) -> str | None:
+    """Today's date (IST) while the trading day isn't over, else None.
+
+    Yahoo serves today's bar while the market is still open. These are end-of-day
+    alerts, so a half-finished day stays out until the 16:00 run and later."""
+    now = (now or datetime.now(timezone.utc)).astimezone(IST)
+    return now.date().isoformat() if now.hour < 16 else None
+
+
 def _prices(days: int) -> int:
     frames = prices.download(SYMBOLS)
     index = frames.get(INDEX)
@@ -67,6 +77,12 @@ def _prices(days: int) -> int:
         all_prices += p_rows
         if sym != INDEX:
             all_signals += s_rows
+    today = unfinished_day()
+    if today:
+        all_prices = [r for r in all_prices if r["date"] != today]
+        all_signals = [r for r in all_signals if r["date"] != today]
+        for table in ("prices", "signals"):  # half-day rows from an earlier run today
+            db.client().table(table).delete().eq("date", today).execute()
     db.upsert("prices", all_prices, on_conflict="symbol,date")
     db.upsert("signals", all_signals, on_conflict="symbol,date")
     return len(all_prices)

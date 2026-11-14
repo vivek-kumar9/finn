@@ -30,7 +30,8 @@ const MOVE_BOOST = 3;
 export function anchorOf(stories: Story[], signals: Signal[]): number {
   const s = Math.max(0, ...stories.map((x) => Date.parse(x.last_at)));
   const p = Math.max(0, ...signals.map((x) => closeOf(x.date)));
-  return Math.max(s, p) || Date.now();
+  // Never later than now: a day's prices are stamped with its 15:30 close.
+  return Math.min(Math.max(s, p) || Date.now(), Date.now());
 }
 
 /** NSE closes at 15:30 IST, 10:00 UTC. */

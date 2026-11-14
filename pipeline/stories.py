@@ -22,7 +22,9 @@ WEIGHT = {
     "investor_meetings": 1, "unclassified": 0,
 }
 JUNIOR_MANAGEMENT_WEIGHT = 5
-WINDOW = {"results": timedelta(days=21)}
+# Leadership filings get a short window: two appointments a week apart are two
+# events, and grouping them made the later one look like the reason for an earlier move.
+WINDOW = {"results": timedelta(days=21), "management_change": timedelta(days=2)}
 DEFAULT_WINDOW = timedelta(days=7)
 
 _BOILERPLATE = re.compile(
